@@ -1,2 +1,4 @@
 __pycache__/
 cluster_matrix/ggml/build/
+ggml/libtorch
+libtorch-shared-with-deps-2.2.2+cpu.zip
