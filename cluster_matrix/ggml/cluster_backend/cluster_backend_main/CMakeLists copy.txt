@@ -1,0 +1,61 @@
+cmake_minimum_required(VERSION 3.10)
+project(OpenClusterAI)
+
+# LibTorch REQUIRES C++17 as of version 2.1+ (Standard in 2025)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -------------------
+# Find LibTorch
+# -------------------
+# Tell CMake exactly where to find the Torch configuration file
+set(Torch_DIR "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/ggml/libtorch/share/cmake/Torch")
+find_package(Torch REQUIRED)
+
+# -------------------
+# ZMQ & Threads
+# -------------------
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
+find_package(Threads REQUIRED)
+find_package(OpenCL REQUIRED)
+# -------------------
+# llama_zmq_server
+# -------------------
+add_executable(llama_zmq_server llama_zmq_server.cpp)
+target_link_libraries(llama_zmq_server PRIVATE 
+    ggml 
+    ${ZMQ_LIBRARIES} 
+    ${TORCH_LIBRARIES}
+    Threads::Threads
+    OpenCL::OpenCL 
+)
+
+target_include_directories(llama_zmq_server PRIVATE ${ZMQ_INCLUDE_DIRS})
+target_include_directories(llama_zmq_server PRIVATE ${OpenCL_INCLUDE_DIRS})
+
+if (GGML_CUDA)
+    target_compile_definitions(llama_zmq_server PRIVATE GGML_USE_CUDA)
+endif()
+if (GGML_METAL)
+    target_compile_definitions(llama_zmq_server PRIVATE GGML_USE_METAL)
+endif()
+
+# -------------------
+# matrix-backend
+# -------------------
+add_executable(matrix-backend matrix_backend.hpp)
+target_link_libraries(matrix-backend PRIVATE 
+    ggml 
+    ${ZMQ_LIBRARIES} 
+    Threads::Threads
+    OpenCL::OpenCL
+)
+target_include_directories(matrix-backend PRIVATE ${ZMQ_INCLUDE_DIRS})
+
+if (GGML_CUDA)
+    target_compile_definitions(matrix-backend PRIVATE GGML_USE_CUDA)
+endif()
+if (GGML_METAL)
+    target_compile_definitions(matrix-backend PRIVATE GGML_USE_METAL)
+endif()
