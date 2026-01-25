@@ -27,6 +27,7 @@
 #include <list>
 #include <cstdint>
 #include <algorithm>
+#include <cctype>
 #include <torch/torch.h>
 
 
@@ -62,6 +63,58 @@ struct combined_matrix_shards
     // Note: Using std::list for received data allows efficient insertion
     //       as shards arrive in potentially non-sequential order from workers
 };
+
+
+struct matrix_shard_object
+{
+    std::string base_file_name;
+    int rows_A = 0;
+    int cols_A = 0;
+    int batchA = 1;
+    int depthA = 1;
+    std::shared_ptr<std::vector<float>> data;
+    int output_dtype_tag = -1; // -1 float32, -2 float16, -3 bfloat16
+};
+
+static inline float bf16_to_f32(uint16_t v) {
+    uint32_t bits = uint32_t(v) << 16;
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline float fp16_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
+    uint32_t exp = (h & 0x7C00u) >> 10;
+    uint32_t mant = (h & 0x03FFu);
+
+    uint32_t f_bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            f_bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FFu;
+            const uint32_t f_exp = (exp + (127 - 15)) << 23;
+            const uint32_t f_mant = mant << 13;
+            f_bits = sign | f_exp | f_mant;
+        }
+    } else if (exp == 0x1F) {
+        f_bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        const uint32_t f_exp = (exp + (127 - 15)) << 23;
+        const uint32_t f_mant = mant << 13;
+        f_bits = sign | f_exp | f_mant;
+    }
+
+    float out;
+    std::memcpy(&out, &f_bits, sizeof(out));
+    return out;
+}
 
 // Function to execute a shell command and capture its output
 std::string exec_command(const char* cmd)
@@ -214,6 +267,10 @@ class llama_zmq_server
         // In your class member variables:
         std::vector<std::string> matrix_file_paths;
 
+        // In-memory matrix shard store (no /dev/shm files).
+        std::list<matrix_shard_object> matrix_shard_object_list;
+        std::mutex matrix_shard_object_mutex;
+
         std::vector<std::string> received_data_eth_linux_command;
         std::vector<std::string> received_data_wifi_linux_command;
         std::vector<std::string> received_data_eth_server_command;
@@ -222,10 +279,10 @@ class llama_zmq_server
         // Thread-safe mutexes (ADD THESE)
         std::mutex linux_commands_mutex;
         std::mutex server_commands_mutex;
-	        std::mutex file_data_mutex;
-	        std::mutex wifi_commands_mutex;
-	        std::mutex head_node_sender_mutex;
-	        std::mutex ack_sender_mutex;
+	    std::mutex file_data_mutex;
+	    std::mutex wifi_commands_mutex;
+	    std::mutex head_node_sender_mutex;
+	    std::mutex ack_sender_mutex;
         
         std::atomic<bool> server_running;
         llama_matrix_backend matrix_backend_llama;
@@ -242,11 +299,319 @@ class llama_zmq_server
         std::map<std::string, int> output_shard_counters;
         std::mutex output_shard_mutex;
 
+    private:
+        static std::string normalize_matrix_key(const std::string& path_or_name) {
+            return std::filesystem::path(path_or_name).filename().string();
+        }
+
+        static bool decode_matrix_binary_payload(
+            const std::vector<uint8_t>& bytes,
+            matrix_shard_object& out,
+            const std::string& base_file_name
+        ) {
+            if (bytes.size() < 5 * sizeof(int)) {
+                std::cerr << "ERROR: Matrix payload too small for header: " << base_file_name << std::endl;
+                return false;
+            }
+
+            int tag_or_ndim = 0;
+            std::memcpy(&tag_or_ndim, bytes.data(), sizeof(int));
+
+            int dtype_tag = -1; // legacy default float32
+            int dims[4] = {1, 1, 1, 1}; // batch, depth, rows, cols
+            int header_ints = 0;
+
+            if (tag_or_ndim < 0) {
+                dtype_tag = tag_or_ndim;
+                header_ints = 5; // dtype_tag + 4 dims
+                std::memcpy(&dims[0], bytes.data() + sizeof(int), 4 * sizeof(int));
+            } else {
+                const int ndim = tag_or_ndim;
+                if (ndim != 2 && ndim != 3 && ndim != 4) {
+                    std::cerr << "ERROR: Unsupported ndim=" << ndim << " for " << base_file_name << std::endl;
+                    return false;
+                }
+                header_ints = 1 + ndim;
+                std::vector<int> vdims((size_t)ndim);
+                std::memcpy(vdims.data(), bytes.data() + sizeof(int), (size_t)ndim * sizeof(int));
+                if (ndim == 2) {
+                    dims[0] = 1; dims[1] = 1; dims[2] = vdims[0]; dims[3] = vdims[1];
+                } else if (ndim == 3) {
+                    dims[0] = vdims[0]; dims[1] = 1; dims[2] = vdims[1]; dims[3] = vdims[2];
+                } else {
+                    dims[0] = vdims[0]; dims[1] = vdims[1]; dims[2] = vdims[2]; dims[3] = vdims[3];
+                }
+            }
+
+            if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+                std::cerr << "ERROR: Unsupported dtype_tag=" << dtype_tag << " for " << base_file_name << std::endl;
+                return false;
+            }
+
+            const int batch = dims[0];
+            const int depth = dims[1];
+            const int rows = dims[2];
+            const int cols = dims[3];
+
+            if (batch <= 0 || depth <= 0 || rows <= 0 || cols <= 0) {
+                std::cerr << "ERROR: Invalid dims for " << base_file_name << ": "
+                          << batch << "," << depth << "," << rows << "," << cols << std::endl;
+                return false;
+            }
+
+            const size_t total_elements =
+                static_cast<size_t>(batch) * static_cast<size_t>(depth) *
+                static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+            const size_t header_bytes = static_cast<size_t>(header_ints) * sizeof(int);
+            const size_t elem_bytes = (dtype_tag == -1) ? sizeof(float) : sizeof(uint16_t);
+            const size_t need_bytes = header_bytes + total_elements * elem_bytes;
+            if (bytes.size() < need_bytes) {
+                std::cerr << "ERROR: Truncated payload for " << base_file_name
+                          << " need=" << need_bytes << " got=" << bytes.size() << std::endl;
+                return false;
+            }
+
+            out.base_file_name = normalize_matrix_key(base_file_name);
+            out.batchA = batch;
+            out.depthA = depth;
+	            out.rows_A = rows;
+	            out.cols_A = cols;
+	            out.output_dtype_tag = dtype_tag;
+	            out.data = std::make_shared<std::vector<float>>(total_elements);
+
+	            const uint8_t* payload = bytes.data() + header_bytes;
+	            float* out_f32 = out.data->data();
+	            if (dtype_tag == -1) {
+	                std::memcpy(out_f32, payload, total_elements * sizeof(float));
+	            } else {
+	                const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload);
+	                for (size_t i = 0; i < total_elements; ++i) {
+	                    out_f32[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
+	                }
+	            }
+
+            return true;
+        }
+
+        void upsert_matrix_shard_object(matrix_shard_object obj) {
+            const std::string key = normalize_matrix_key(obj.base_file_name);
+            obj.base_file_name = key;
+
+            std::lock_guard<std::mutex> lock(matrix_shard_object_mutex);
+            for (auto& existing : matrix_shard_object_list) {
+                if (existing.base_file_name == key) {
+                    existing = std::move(obj);
+                    return;
+                }
+            }
+            matrix_shard_object_list.push_back(std::move(obj));
+        }
+
+        bool try_get_matrix_shard_object(const std::string& path_or_name, matrix_shard_object& out) {
+            const std::string key = normalize_matrix_key(path_or_name);
+            std::lock_guard<std::mutex> lock(matrix_shard_object_mutex);
+            for (const auto& existing : matrix_shard_object_list) {
+                if (existing.base_file_name == key) {
+                    out = existing;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void store_matrix_result_to_shard_list(
+            const std::string& filename,
+            const MatrixResult& result,
+            int output_dtype_tag
+        ) {
+            matrix_shard_object obj;
+            obj.base_file_name = normalize_matrix_key(filename);
+            obj.batchA = result.dims[0];
+            obj.depthA = result.dims[1];
+            obj.rows_A = result.dims[2];
+            obj.cols_A = result.dims[3];
+            obj.output_dtype_tag = output_dtype_tag;
+
+            size_t total_elements = 1;
+	            for (int i = 0; i < 4; ++i) {
+	                const int v = (result.dims[i] > 0) ? result.dims[i] : 1;
+	                total_elements *= static_cast<size_t>(v);
+	            }
+
+	            obj.data = std::make_shared<std::vector<float>>(total_elements);
+	            std::memcpy(obj.data->data(), result.data.get(), total_elements * sizeof(float));
+	            upsert_matrix_shard_object(std::move(obj));
+	        }
+
+        bool load_matrix_from_shard_list(
+            const std::string& path_or_name,
+            std::unique_ptr<float[]>& out,
+            int& rows,
+            int& cols,
+            int& batch,
+            int& depth,
+            int& dtype_tag
+        ) {
+            matrix_shard_object obj;
+            if (!try_get_matrix_shard_object(path_or_name, obj)) {
+                std::cerr << "❌ Matrix not in matrix_shard_object_list: " << path_or_name << std::endl;
+                return false;
+            }
+
+            rows = obj.rows_A;
+            cols = obj.cols_A;
+            batch = obj.batchA;
+            depth = obj.depthA;
+            dtype_tag = obj.output_dtype_tag;
+
+	            const size_t total_elements =
+	                static_cast<size_t>(batch) * static_cast<size_t>(depth) *
+	                static_cast<size_t>(rows) * static_cast<size_t>(cols);
+	            out = std::make_unique<float[]>(total_elements);
+	            if (!obj.data || obj.data->size() != total_elements) {
+	                std::cerr << "❌ Matrix data missing or size mismatch for: " << path_or_name << std::endl;
+	                return false;
+	            }
+	            std::memcpy(out.get(), obj.data->data(), total_elements * sizeof(float));
+	            return true;
+	        }
+
+        torch::Tensor load_matrix_from_shard_list_as_torch(const std::string& path_or_name) {
+            matrix_shard_object obj;
+            if (!try_get_matrix_shard_object(path_or_name, obj)) {
+                throw std::runtime_error("Matrix not in matrix_shard_object_list: " + path_or_name);
+            }
+
+            std::vector<int64_t> sizes;
+            if (obj.batchA > 1 && obj.depthA > 1) {
+                sizes = {obj.batchA, obj.depthA, obj.rows_A, obj.cols_A};
+            } else if (obj.batchA > 1) {
+                sizes = {obj.batchA, obj.rows_A, obj.cols_A};
+            } else {
+                sizes = {obj.rows_A, obj.cols_A};
+	            }
+
+	            auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	            if (!obj.data) {
+	                throw std::runtime_error("Matrix data missing in matrix_shard_object_list: " + path_or_name);
+	            }
+	            torch::Tensor t = torch::from_blob(obj.data->data(), sizes, options).clone();
+	            return t;
+	        }
+
+        std::filesystem::path resolve_matrix_disk_path(const std::string& file_or_path) const {
+            std::filesystem::path p(file_or_path);
+            if (p.is_absolute() || p.has_parent_path()) {
+                return p;
+            }
+
+            const std::filesystem::path shard_dir(matrix_shard_folder);
+            const std::filesystem::path project_dir(project_folder);
+
+            std::filesystem::path cand1 = shard_dir / p;
+            if (std::filesystem::exists(cand1)) return cand1;
+
+            std::filesystem::path cand2 = project_dir / shard_dir / p;
+            if (std::filesystem::exists(cand2)) return cand2;
+
+            std::filesystem::path cand3 = project_dir / p;
+            if (std::filesystem::exists(cand3)) return cand3;
+
+            return cand2;
+        }
+
+	        bool load_matrix_shard_object_list(const std::vector<std::string>& files_or_names) {
+	            bool ok = true;
+	            for (const auto& f : files_or_names) {
+	                const std::string key = normalize_matrix_key(f);
+	                matrix_shard_object already;
+                if (try_get_matrix_shard_object(key, already)) {
+                    continue;
+                }
+
+                const std::filesystem::path disk_path = resolve_matrix_disk_path(f);
+                int rows = 0, cols = 0, depth = 1, batch = 1;
+                std::unique_ptr<float[]> data = load_matrix_bin(disk_path.string().c_str(), rows, cols, depth, batch);
+                if (!data) {
+                    std::cerr << "❌ Failed to load matrix from disk: " << disk_path << std::endl;
+                    ok = false;
+                    continue;
+                }
+
+                const int dtype_tag = read_dtype_tag_from_bin_file(disk_path.string());
+                const size_t total_elements =
+                    static_cast<size_t>(batch) * static_cast<size_t>(depth) *
+                    static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+                matrix_shard_object obj;
+                obj.base_file_name = key;
+                obj.rows_A = rows;
+                obj.cols_A = cols;
+	                obj.batchA = batch;
+	                obj.depthA = depth;
+	                obj.output_dtype_tag = dtype_tag;
+	                obj.data = std::make_shared<std::vector<float>>(total_elements);
+	                std::memcpy(obj.data->data(), data.get(), total_elements * sizeof(float));
+	                upsert_matrix_shard_object(std::move(obj));
+	            }
+	            return ok;
+	        }
+
+	        int default_vram_backend_index() const {
+	            // Prefer the first non-CPU GGML backend (CPU backend is usually appended last).
+	            for (size_t i = 0; i < matrix_backend_llama.ggml_backends.size(); ++i) {
+	                ggml_backend_t backend = matrix_backend_llama.ggml_backends[i];
+	                if (!backend) continue;
+	                const char* n = ggml_backend_name(backend);
+	                if (!n) continue;
+	                std::string name(n);
+	                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+	                if (name.find("cpu") == std::string::npos) {
+	                    return (int) i;
+	                }
+	            }
+	            return -1;
+	        }
+
+	        bool load_matrix_shard_object_list_VRAM(const std::vector<std::string>& files_or_names) {
+	            const bool ok = load_matrix_shard_object_list(files_or_names);
+
+	            const int backend_index = default_vram_backend_index();
+	            if (backend_index < 0) {
+	                return ok;
+	            }
+	            auto& vram = get_vram_cache_manager();
+	            if (!vram.enabled(backend_index)) {
+	                return ok;
+	            }
+
+	            for (const auto& f : files_or_names) {
+	                const std::string key = normalize_matrix_key(f);
+	                matrix_shard_object obj;
+	                if (!try_get_matrix_shard_object(key, obj) || !obj.data) {
+	                    continue;
+	                }
+	                // GGML tensor dims are {cols, rows, depth, batch}
+	                vram.cache_tensor_f32_4d(
+	                    backend_index,
+	                    key,
+	                    obj.data->data(),
+	                    obj.cols_A,
+	                    obj.rows_A,
+	                    obj.depthA,
+	                    obj.batchA
+	                );
+	            }
+
+	            return ok;
+	        }
+
 
     public:            
         // Constructor - initializes ZMQ server with dual network interfaces
-        llama_zmq_server() : 
-            zmq_context(1),
+	        llama_zmq_server() : 
+	            zmq_context(1),
             file_receiver_eth(zmq_context, zmq::socket_type::pull),
             file_sender_eth(zmq_context, zmq::socket_type::push),
             file_receiver_wifi(zmq_context, zmq::socket_type::pull),
@@ -268,8 +633,13 @@ class llama_zmq_server
 
 
 
-            matrix_shard_folder = get_env("OPEN_CLUSTER_MATRIX_SHARD_DIRECTORY", 
-                                        "/dev/shm/matrix_shards/");
+            matrix_shard_folder = get_env("OPEN_CLUSTER_MATRIX_SHARD_DIRECTORY",
+                                        "matrix_shards/");
+            if (matrix_shard_folder.rfind("/dev/shm/", 0) == 0) {
+                std::cerr << "WARNING: OPEN_CLUSTER_MATRIX_SHARD_DIRECTORY points to /dev/shm; "
+                          << "overriding to 'matrix_shards/' to avoid RAM-backed FS." << std::endl;
+                matrix_shard_folder = "matrix_shards/";
+            }
             matrix_results_folder = get_env("OPEN_CLUSTER_MATRIX_RESULTS_DIRECTORY", 
                                         "/dev/shm/matrix_results/");
             
@@ -376,83 +746,132 @@ class llama_zmq_server
                 init_openCL_GPUS();
             #else
                 std::cout << "\nOpenCL backend disabled at compile time" << std::endl;
-            #endif
-            
-            std::cout << "\nServer initialization complete" << std::endl;
-            std::cout << "==============================\n" << std::endl;
-        }
+	            #endif
 
-		    void send_ack(std::string ack_msg = "ACK") 
-		    {
-		        zmq::message_t ack(ack_msg.data(), ack_msg.size());
-		        std::lock_guard<std::mutex> lock(ack_sender_mutex);
-		        ack_sender.send(ack, zmq::send_flags::none);
-		    }
+	            // Initialize VRAM caching buffers (best-effort) and print GPU VRAM info.
+	            set_VRAM_buffers(matrix_backend_llama);
+	            inspect_GPU();
+	            
+	            std::cout << "\nServer initialization complete" << std::endl;
+	            std::cout << "==============================\n" << std::endl;
+	        }
 
-	        bool send_combined_bin_to_python(
-	            const std::string& matrix_name,
-	            const MatrixResult& full,
-	            int output_dtype_tag
-	        )
+	        void inspect_GPU()
 	        {
+	            std::cout << "\n=== GPU VRAM Inspection ===" << std::endl;
+	            try {
+	                std::vector<cl::Platform> platforms;
+	                cl::Platform::get(&platforms);
+	                size_t gpu_idx = 0;
+	                for (const auto& plat : platforms) {
+	                    std::vector<cl::Device> devices;
+	                    plat.getDevices(CL_DEVICE_TYPE_GPU, &devices);
+	                    for (const auto& dev : devices) {
+	                        std::string name = dev.getInfo<CL_DEVICE_NAME>();
+	                        name.erase(std::remove(name.begin(), name.end(), '\n'), name.end());
+	                        name.erase(std::remove(name.begin(), name.end(), '\r'), name.end());
+	                        const cl_ulong total = dev.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>();
+	                        std::cout << "OpenCL GPU " << gpu_idx++ << ": " << name
+	                                  << " | Total VRAM: " << (double)total / (1024.0 * 1024.0 * 1024.0) << " GiB"
+	                                  << std::endl;
+	                    }
+	                }
+	                if (gpu_idx == 0) {
+	                    std::cout << "OpenCL GPU: none detected (cannot query total VRAM via OpenCL)" << std::endl;
+	                }
+	            } catch (...) {
+	                std::cout << "OpenCL GPU query failed (VRAM total unavailable)" << std::endl;
+	            }
+
+	            auto& mgr = get_vram_cache_manager();
+	            std::cout << "GGML VRAM cache budget per backend:" << std::endl;
+	            for (size_t i = 0; i < matrix_backend_llama.ggml_backends.size(); ++i) {
+	                ggml_backend_t backend = matrix_backend_llama.ggml_backends[i];
+	                const char* backend_name = backend ? ggml_backend_name(backend) : "(null)";
+	                const size_t budget = mgr.budget_bytes((int)i);
+	                const size_t used = mgr.used_bytes((int)i);
+	                const size_t free_budget = mgr.free_budget_bytes((int)i);
+	                std::cout << "  [" << i << "] " << backend_name
+	                          << " | enabled=" << (mgr.enabled((int)i) ? "yes" : "no")
+	                          << " | budget=" << (double)budget / (1024.0 * 1024.0) << " MiB"
+	                          << " | used=" << (double)used / (1024.0 * 1024.0) << " MiB"
+	                          << " | free_budget=" << (double)free_budget / (1024.0 * 1024.0) << " MiB"
+	                          << std::endl;
+	            }
+	            std::cout << "===========================\n" << std::endl;
+	        }
+
+		void send_ack(std::string ack_msg = "ACK") 
+		{
+		    zmq::message_t ack(ack_msg.data(), ack_msg.size());
+		    std::lock_guard<std::mutex> lock(ack_sender_mutex);
+		    ack_sender.send(ack, zmq::send_flags::none);
+		}
+
+	    bool send_combined_bin_to_python(
+	        const std::string& matrix_name,
+	        const MatrixResult& full,
+	        int output_dtype_tag
+	    )
+	    {
 	            // v2 binary wire format:
 	            // [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
-	            const int dtype_tag = output_dtype_tag;
-	            if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
-	                std::cerr << "ERROR: Unsupported output dtype_tag for combined stream: "
-	                          << dtype_tag << std::endl;
-	                return false;
+	        const int dtype_tag = output_dtype_tag;
+	        if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+	            std::cerr << "ERROR: Unsupported output dtype_tag for combined stream: "
+	                        << dtype_tag << std::endl;
+	            return false;
+	        }
+
+	        const int ndim = 4;
+	        size_t total_elements = 1;
+	        for (int i = 0; i < ndim; ++i) {
+	            const int v = (full.dims[i] > 0) ? full.dims[i] : 1;
+	            total_elements *= static_cast<size_t>(v);
+	        }
+
+	        const size_t elem_bytes = (dtype_tag == -1) ? sizeof(float) : sizeof(uint16_t);
+	        const size_t header_bytes = sizeof(int) * 5;
+	        const size_t payload_bytes = header_bytes + total_elements * elem_bytes;
+
+	        zmq::message_t payload_msg(payload_bytes);
+	        auto* header = static_cast<int*>(payload_msg.data());
+	        header[0] = dtype_tag;
+	        for (int i = 0; i < ndim; ++i) {
+	            header[i + 1] = (full.dims[i] > 0) ? full.dims[i] : 1;
+	        }
+
+	        uint8_t* data_ptr = static_cast<uint8_t*>(payload_msg.data()) + header_bytes;
+	        if (dtype_tag == -1) {
+	            std::memcpy(data_ptr, full.data.get(), total_elements * sizeof(float));
+	        } else if (dtype_tag == -2) {
+	            uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+	            for (size_t i = 0; i < total_elements; ++i) {
+	                out[i] = float_to_fp16_bits(full.data[i]);
 	            }
-
-	            const int ndim = 4;
-	            size_t total_elements = 1;
-	            for (int i = 0; i < ndim; ++i) {
-	                const int v = (full.dims[i] > 0) ? full.dims[i] : 1;
-	                total_elements *= static_cast<size_t>(v);
-	            }
-
-	            const size_t elem_bytes = (dtype_tag == -1) ? sizeof(float) : sizeof(uint16_t);
-	            const size_t header_bytes = sizeof(int) * 5;
-	            const size_t payload_bytes = header_bytes + total_elements * elem_bytes;
-
-	            zmq::message_t payload_msg(payload_bytes);
-	            auto* header = static_cast<int*>(payload_msg.data());
-	            header[0] = dtype_tag;
-	            for (int i = 0; i < ndim; ++i) {
-	                header[i + 1] = (full.dims[i] > 0) ? full.dims[i] : 1;
-	            }
-
-	            uint8_t* data_ptr = static_cast<uint8_t*>(payload_msg.data()) + header_bytes;
-	            if (dtype_tag == -1) {
-	                std::memcpy(data_ptr, full.data.get(), total_elements * sizeof(float));
-	            } else if (dtype_tag == -2) {
-	                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
-	                for (size_t i = 0; i < total_elements; ++i) {
-	                    out[i] = float_to_fp16_bits(full.data[i]);
-	                }
-	            } else {
-	                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
-	                for (size_t i = 0; i < total_elements; ++i) {
-	                    out[i] = float_to_bf16_bits(full.data[i]);
-	                }
-	            }
-
-	            const std::string header_str = "BIN_COMBINED=" + matrix_name;
-	            try {
-	                zmq::message_t header_msg(header_str.data(), header_str.size());
-
-	                std::lock_guard<std::mutex> lock(ack_sender_mutex);
-	                ack_sender.send(header_msg, zmq::send_flags::sndmore);
-	                ack_sender.send(payload_msg, zmq::send_flags::none);
-	                std::cout << "📤 Streamed combined matrix to Python: "
-	                          << matrix_name << " (" << payload_bytes << " bytes)" << std::endl;
-	                return true;
-	            } catch (const zmq::error_t& e) {
-	                std::cerr << "ERROR: Failed to stream combined PT to Python: "
-	                          << e.what() << std::endl;
-	                return false;
+	        } else {
+	            uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+	            for (size_t i = 0; i < total_elements; ++i) {
+	                out[i] = float_to_bf16_bits(full.data[i]);
 	            }
 	        }
+
+	        const std::string header_str = "BIN_COMBINED=" + matrix_name;
+	        try {
+	            zmq::message_t header_msg(header_str.data(), header_str.size());
+
+	            std::lock_guard<std::mutex> lock(ack_sender_mutex);
+	            ack_sender.send(header_msg, zmq::send_flags::sndmore);
+	            ack_sender.send(payload_msg, zmq::send_flags::none);
+	            std::cout << "📤 Streamed combined matrix to Python: "
+	                        << matrix_name << " (" << payload_bytes << " bytes)" << std::endl;
+	            return true;
+	        } catch (const zmq::error_t& e) {
+	            std::cerr << "ERROR: Failed to stream combined PT to Python: "
+	                      << e.what() << std::endl;
+	            return false;
+	        }
+	    }
 
         void run_server() 
         {
@@ -460,12 +879,12 @@ class llama_zmq_server
             
             // Start network listener threads for dual-interface operation
             std::thread eth_thread(&llama_zmq_server::listen_interface, this, "Ethernet");
-            std::thread wifi_thread(&llama_zmq_server::listen_interface, this, "WiFi");
+
             std::thread process_command_thread(&llama_zmq_server::process_command, this);
             
             // Detach threads to run as daemon processes (background services)
             eth_thread.detach();
-            wifi_thread.detach();
+            //wifi_thread.detach();
             process_command_thread.detach();
             
             std::cout << "✅ Network listeners started successfully" << std::endl;
@@ -803,6 +1222,36 @@ class llama_zmq_server
                 const std::string& command_type = command_args[0];
 
                 // ----------------------------
+                // Matrix Load Operation (Disk -> In-Memory List)
+                // ----------------------------
+                if (command_type == "load_matrix_shard_object_list")
+                {
+                    if (command_args.size() < 2) {
+                        std::cerr << "❌ load_matrix_shard_object_list requires at least 1 filename" << std::endl;
+                        return -3;
+                    }
+
+                    std::vector<std::string> files(command_args.begin() + 1, command_args.end());
+                    const bool ok = load_matrix_shard_object_list(files);
+                    send_ack("ACK_load_matrix_shard_object_list_complete");
+                    return ok ? 0 : -7;
+                }
+
+                if (command_type == "load_matrix_shard_object_list_VRAM")
+                {
+                    if (command_args.size() < 2) {
+                        std::cerr << "❌ load_matrix_shard_object_list_VRAM requires at least 1 filename" << std::endl;
+                        return -3;
+                    }
+
+                    std::vector<std::string> files(command_args.begin() + 1, command_args.end());
+                    const bool ok = load_matrix_shard_object_list_VRAM(files);
+                    // Keep ACK name stable for Python callers.
+                    send_ack("ACK_load_matrix_shard_object_list_complete");
+                    return ok ? 0 : -7;
+                }
+
+                // ----------------------------
                 // Matrix Computation Operations
                 // ----------------------------
                 if (command_type == "llama" || command_type == "opencl" || command_type == "torch") 
@@ -836,11 +1285,20 @@ class llama_zmq_server
                     
                     if (command_type == "llama")
                     {
+                        matrix_shard_object matrixA_obj;
+                        matrix_shard_object matrixB_obj;
+                        if (!try_get_matrix_shard_object(command_args[3], matrixA_obj) ||
+                            !try_get_matrix_shard_object(command_args[1], matrixB_obj)) {
+                            std::cerr << "❌ Missing input matrix in matrix_shard_object_list" << std::endl;
+                            std::cerr << "   Needed: '" << command_args[3] << "' and '" << command_args[1] << "'" << std::endl;
+                            return -8;
+                        }
+
                         operation_success = matrix_operation(
                             command_type,
-                            command_args[3].c_str(),   // Matrix B path
+                            matrixA_obj,               // Matrix B (GGML order)
                             transposeB,
-                            command_args[1].c_str(),   // Matrix A path
+                            matrixB_obj,               // Matrix A (GGML order)
                             transposeA,
                             use_gpu,
                             gpu_id,
@@ -852,11 +1310,20 @@ class llama_zmq_server
                     }
                     else
                     {
+                        matrix_shard_object matrixA_obj;
+                        matrix_shard_object matrixB_obj;
+                        if (!try_get_matrix_shard_object(command_args[1], matrixA_obj) ||
+                            !try_get_matrix_shard_object(command_args[3], matrixB_obj)) {
+                            std::cerr << "❌ Missing input matrix in matrix_shard_object_list" << std::endl;
+                            std::cerr << "   Needed: '" << command_args[1] << "' and '" << command_args[3] << "'" << std::endl;
+                            return -8;
+                        }
+
                         operation_success = matrix_operation(
                             command_type,
-                            command_args[1].c_str(),   // Matrix A path
+                            matrixA_obj,
                             transposeA,
-                            command_args[3].c_str(),   // Matrix B path
+                            matrixB_obj,
                             transposeB,
                             use_gpu,
                             gpu_id,
@@ -1055,334 +1522,131 @@ class llama_zmq_server
                 std::cout << "Processing: " << local_reserved_files.size() << " reserved file(s)" << std::endl;
             }
 
-            // Iterate through each reserved file entry and handle cases:
-            // - parallel (ETH + WiFi halves)
-            // - single-interface ETH
-            // - single-interface WiFi
+	            auto process_payload = [&](const std::string& filename_in, const std::vector<uint8_t>& bytes) {
+	                std::string filename = normalize_matrix_key(filename_in);
+	                bool prefer_vram = false;
+	                const std::string vram_prefix = "VRAM|";
+	                if (filename.rfind(vram_prefix, 0) == 0) {
+	                    prefer_vram = true;
+	                    filename = filename.substr(vram_prefix.size());
+	                }
+	                const bool is_sent_back = filename.rfind("sent_back=", 0) == 0 || filename.find("sent_back=") != std::string::npos;
+
+                if (is_sent_back)
+                {
+                    // Worker result shard streamed to head for combining.
+                    const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
+                    if (!is_head_node) {
+                        return;
+                    }
+
+                    const size_t pos = filename.find("sent_back=");
+                    const std::string actual_filename = (pos == std::string::npos)
+                        ? filename
+                        : filename.substr(pos + 10);
+
+                    matrix_shard_object obj;
+                    if (!decode_matrix_binary_payload(bytes, obj, actual_filename)) {
+                        std::cerr << "ERROR: Failed to decode sent_back payload: " << actual_filename << std::endl;
+                        return;
+                    }
+
+                    const int rows = obj.rows_A;
+	                    const int cols = obj.cols_A;
+	                    const size_t need = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+	                    auto shard_data = std::make_unique<float[]>(need);
+	                    if (!obj.data || obj.data->size() < need) {
+	                        std::cerr << "ERROR: Sent_back matrix data missing or truncated: " << actual_filename << std::endl;
+	                        return;
+	                    }
+	                    std::memcpy(shard_data.get(), obj.data->data(), need * sizeof(float));
+
+                    handle_combine_matrix_shard_list(
+                        actual_filename,
+                        std::move(shard_data),
+                        rows,
+                        cols,
+                        0,
+                        obj.output_dtype_tag
+                    );
+
+                    return;
+                }
+
+	                // Input matrices: keep fully in memory and ACK the sender.
+	                matrix_shard_object obj;
+	                if (!decode_matrix_binary_payload(bytes, obj, filename)) {
+	                    std::cerr << "ERROR: Failed to decode matrix payload: " << filename << std::endl;
+	                    return;
+	                }
+
+	                // If requested, try to cache this matrix into VRAM (best-effort).
+	                if (prefer_vram) {
+	                    const int backend_index = default_vram_backend_index();
+	                    auto& vram = get_vram_cache_manager();
+	                    if (backend_index >= 0 && vram.enabled(backend_index) && obj.data) {
+	                        vram.cache_tensor_f32_4d(
+	                            backend_index,
+	                            obj.base_file_name,
+	                            obj.data->data(),
+	                            obj.cols_A,
+	                            obj.rows_A,
+	                            obj.depthA,
+	                            obj.batchA
+	                        );
+	                    }
+	                }
+
+	                upsert_matrix_shard_object(std::move(obj));
+
+                // Persist the exact bytes to disk for later reload via `load_matrix_shard_object_list`.
+                // (No /dev/shm usage; matrix_shard_folder defaults to `matrix_shards/`.)
+                try {
+                    std::filesystem::path shard_dir(matrix_shard_folder);
+                    if (!shard_dir.is_absolute()) {
+                        shard_dir = std::filesystem::path(project_folder) / shard_dir;
+                    }
+                    std::filesystem::create_directories(shard_dir);
+                    std::filesystem::path out_path = shard_dir / filename;
+
+                    std::ofstream file(out_path, std::ios::binary);
+                    if (!file.is_open()) {
+                        std::cerr << "ERROR: Failed to open for write: " << out_path << std::endl;
+                    } else {
+                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                        file.close();
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "ERROR: Failed to persist matrix bytes for " << filename
+                              << ": " << e.what() << std::endl;
+                }
+
+                send_ack(filename);
+            };
+
             for (auto &rf : local_reserved_files)
             {
                 std::string filename = rf.save_parallel_file_name.empty() ? std::string("unknown") : rf.save_parallel_file_name[0];
-                // Helper lambda to write raw bytes to path
-                auto write_raw = [&](const std::filesystem::path &path, const std::vector<uint8_t> &bytes) -> bool {
-                    std::filesystem::create_directories(path.parent_path());
-                    std::ofstream file(path, std::ios::binary);
-                    if (!file.is_open()) return false;
-                    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                    file.close();
-                    return true;
-                };
 
-                // If we have both halves (parallel) -> combine
                 if ((rf.is_parallel) || (!rf.received_data_eth_file.empty() && !rf.received_data_wifi_file.empty()))
                 {
                     std::vector<uint8_t> combined;
                     combined.reserve(rf.received_data_eth_file.size() + rf.received_data_wifi_file.size());
                     combined.insert(combined.end(), rf.received_data_eth_file.begin(), rf.received_data_eth_file.end());
                     combined.insert(combined.end(), rf.received_data_wifi_file.begin(), rf.received_data_wifi_file.end());
-
-                    size_t sent_back_pos = filename.find("sent_back=");
-                    if (sent_back_pos != std::string::npos)
-                    {
-                        std::string actual_filename = filename.substr(sent_back_pos + 10);
-                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
-                        if (write_raw(save_path, combined))
-                            std::cout << "PARALLEL saved to RESULTS: " << save_path << " (" << combined.size() << " bytes)" << std::endl;
-                        else
-                            std::cerr << "Failed to save PARALLEL sent_back: " << save_path << std::endl;
-
-                        // Head node-specific processing for combined sent_back (attempt to parse 4D tensor)
-                        if (local_IP_eth == head_node_ip_eth)
-                        {
-                            auto bf16_to_f32 = [](uint16_t v) -> float {
-                                uint32_t bits = uint32_t(v) << 16;
-                                float out;
-                                std::memcpy(&out, &bits, sizeof(out));
-                                return out;
-                            };
-
-                            auto fp16_to_f32 = [](uint16_t h) -> float {
-                                const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
-                                uint32_t exp = (h & 0x7C00u) >> 10;
-                                uint32_t mant = (h & 0x03FFu);
-
-                                uint32_t f_bits = 0;
-                                if (exp == 0) {
-                                    if (mant == 0) {
-                                        f_bits = sign;
-                                    } else {
-                                        exp = 1;
-                                        while ((mant & 0x0400u) == 0) {
-                                            mant <<= 1;
-                                            exp--;
-                                        }
-                                        mant &= 0x03FFu;
-                                        const uint32_t f_exp = (exp + (127 - 15)) << 23;
-                                        const uint32_t f_mant = mant << 13;
-                                        f_bits = sign | f_exp | f_mant;
-                                    }
-                                } else if (exp == 0x1F) {
-                                    f_bits = sign | 0x7F800000u | (mant << 13);
-                                } else {
-                                    const uint32_t f_exp = (exp + (127 - 15)) << 23;
-                                    const uint32_t f_mant = mant << 13;
-                                    f_bits = sign | f_exp | f_mant;
-                                }
-
-                                float out;
-                                std::memcpy(&out, &f_bits, sizeof(out));
-                                return out;
-                            };
-
-                            const uint8_t* p = combined.data();
-                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
-                            p += sizeof(int);
-                            const int dtype_tag = (tag_or_ndim < 0) ? tag_or_ndim : -1;
-                            const int ndim = (tag_or_ndim < 0) ? 4 : tag_or_ndim;
-                            if (ndim == 4)
-                            {
-                                int dims[4];
-                                for (int i = 0; i < 4; ++i) { dims[i] = *reinterpret_cast<const int*>(p); p += sizeof(int); }
-                                int batch = dims[0];
-                                int depth = dims[1];
-                                int rows = dims[2];
-                                int cols = dims[3];
-                                size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
-                                auto shard_data = std::make_unique<float[]>(total_elements);
-                                if (dtype_tag == -1)
-                                {
-                                    std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
-                                }
-                                else if (dtype_tag == -2 || dtype_tag == -3)
-                                {
-                                    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(p);
-                                    for (size_t i = 0; i < total_elements; ++i)
-                                    {
-                                        shard_data[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
-                                    }
-                                }
-                                else
-                                {
-                                    std::cerr << "ERROR: Unsupported dtype_tag in sent_back payload: " << dtype_tag << std::endl;
-                                    return;
-                                }
-
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, dtype_tag);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
-                        // Try to validate as 4D binary and save via save_matrix_bin; otherwise write raw
-                        bool saved = false;
-                        if (combined.size() >= static_cast<size_t>(5 * sizeof(int)))
-                        {
-                            const uint8_t* p = combined.data();
-                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
-                            // v2 dtype-tagged files must be saved as raw bytes to preserve dtype.
-                            if (tag_or_ndim >= 0 && tag_or_ndim == 4)
-                            {
-                                MatrixResult result;
-                                result.dims[0] = *reinterpret_cast<const int*>(p + sizeof(int));
-                                result.dims[1] = *reinterpret_cast<const int*>(p + 2 * sizeof(int));
-                                result.dims[2] = *reinterpret_cast<const int*>(p + 3 * sizeof(int));
-                                result.dims[3] = *reinterpret_cast<const int*>(p + 4 * sizeof(int));
-                                size_t total_elements = static_cast<size_t>(result.dims[0]) * result.dims[1] * result.dims[2] * result.dims[3];
-                                result.data = std::make_unique<float[]>(total_elements);
-                                std::memcpy(result.data.get(), p + 5 * sizeof(int), total_elements * sizeof(float));
-                                if (save_matrix_bin(save_path.c_str(), result))
-                                {
-                                    saved = true;
-                                    std::cout << "PARALLEL saved to SHARDS: " << save_path << " (" << combined.size() << " bytes)" << std::endl;
-                                }
-                            }
-                        }
-
-                        if (!saved)
-                        {
-                            if (write_raw(save_path, combined))
-                                std::cout << "PARALLEL saved (raw): " << save_path << " (" << combined.size() << " bytes)" << std::endl;
-                            else
-                                std::cerr << "Failed to save PARALLEL file: " << save_path << std::endl;
-                        }
-                    }
+                    process_payload(filename, combined);
                 }
-                // ETH single-interface file
                 else if (!rf.received_data_eth_file.empty())
                 {
-                    const auto &data = rf.received_data_eth_file;
-                    size_t sent_back_pos = filename.find("sent_back=");
-                    if (sent_back_pos != std::string::npos)
-                    {
-                        std::string actual_filename = filename.substr(sent_back_pos + 10);
-                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
-                        if (write_raw(save_path, data))
-                            std::cout << "ETH sent_back saved to RESULTS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                        else
-                            std::cerr << "Failed to save ETH sent_back: " << save_path << std::endl;
-
-                        // Head node-specific processing for shard combination
-                        if (local_IP_eth == head_node_ip_eth)
-                        {
-                            auto bf16_to_f32 = [](uint16_t v) -> float {
-                                uint32_t bits = uint32_t(v) << 16;
-                                float out;
-                                std::memcpy(&out, &bits, sizeof(out));
-                                return out;
-                            };
-
-                            auto fp16_to_f32 = [](uint16_t h) -> float {
-                                const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
-                                uint32_t exp = (h & 0x7C00u) >> 10;
-                                uint32_t mant = (h & 0x03FFu);
-
-                                uint32_t f_bits = 0;
-                                if (exp == 0) {
-                                    if (mant == 0) {
-                                        f_bits = sign;
-                                    } else {
-                                        exp = 1;
-                                        while ((mant & 0x0400u) == 0) {
-                                            mant <<= 1;
-                                            exp--;
-                                        }
-                                        mant &= 0x03FFu;
-                                        const uint32_t f_exp = (exp + (127 - 15)) << 23;
-                                        const uint32_t f_mant = mant << 13;
-                                        f_bits = sign | f_exp | f_mant;
-                                    }
-                                } else if (exp == 0x1F) {
-                                    f_bits = sign | 0x7F800000u | (mant << 13);
-                                } else {
-                                    const uint32_t f_exp = (exp + (127 - 15)) << 23;
-                                    const uint32_t f_mant = mant << 13;
-                                    f_bits = sign | f_exp | f_mant;
-                                }
-
-                                float out;
-                                std::memcpy(&out, &f_bits, sizeof(out));
-                                return out;
-                            };
-
-                            const uint8_t* p = data.data();
-                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
-                            p += sizeof(int);
-                            const int dtype_tag = (tag_or_ndim < 0) ? tag_or_ndim : -1;
-                            const int ndim = (tag_or_ndim < 0) ? 4 : tag_or_ndim;
-                            if (ndim == 4)
-                            {
-                                int dims[4];
-                                for (int i = 0; i < 4; ++i) { dims[i] = *reinterpret_cast<const int*>(p); p += sizeof(int); }
-                                int batch = dims[0];
-                                int depth = dims[1];
-                                int rows = dims[2];
-                                int cols = dims[3];
-                                size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
-                                auto shard_data = std::make_unique<float[]>(total_elements);
-                                if (dtype_tag == -1)
-                                {
-                                    std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
-                                }
-                                else if (dtype_tag == -2 || dtype_tag == -3)
-                                {
-                                    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(p);
-                                    for (size_t i = 0; i < total_elements; ++i)
-                                    {
-                                        shard_data[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
-                                    }
-                                }
-                                else
-                                {
-                                    std::cerr << "ERROR: Unsupported dtype_tag in sent_back payload: " << dtype_tag << std::endl;
-                                    return;
-                                }
-
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, dtype_tag);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Regular ETH file: for v2 dtype-tagged files, save raw bytes to preserve dtype.
-                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
-                        if (data.size() >= static_cast<size_t>(5 * sizeof(int)))
-                        {
-                            const uint8_t* p = data.data();
-                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
-                            if (tag_or_ndim < 0)
-                            {
-                                if (write_raw(save_path, data))
-                                    std::cout << "ETH saved (raw) to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                                else
-                                    std::cerr << "Failed to save ETH file: " << save_path << std::endl;
-                            }
-                            else if (tag_or_ndim != 4)
-                            {
-                                std::cerr << "ERROR: Worker sent non-4D tensor: " << filename << " (ndim=" << tag_or_ndim << ")" << std::endl;
-                            }
-                            else
-                            {
-                                MatrixResult result;
-                                result.dims[0] = *reinterpret_cast<const int*>(p + sizeof(int));
-                                result.dims[1] = *reinterpret_cast<const int*>(p + 2 * sizeof(int));
-                                result.dims[2] = *reinterpret_cast<const int*>(p + 3 * sizeof(int));
-                                result.dims[3] = *reinterpret_cast<const int*>(p + 4 * sizeof(int));
-                                size_t total_elements = static_cast<size_t>(result.dims[0]) * result.dims[1] * result.dims[2] * result.dims[3];
-                                result.data = std::make_unique<float[]>(total_elements);
-                                std::memcpy(result.data.get(), p + 5 * sizeof(int), total_elements * sizeof(float));
-
-                                if (save_matrix_bin(save_path.c_str(), result))
-                                    std::cout << "ETH saved to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                                else
-                                    std::cerr << "Failed to save ETH file: " << save_path << std::endl;
-                            }
-                        }
-                        else
-                        {
-                            if (write_raw(save_path, data))
-                                std::cout << "ETH saved (raw) to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                            else
-                                std::cerr << "Failed to save ETH file: " << save_path << std::endl;
-                        }
-                    }
+                    process_payload(filename, rf.received_data_eth_file);
                 }
-                // WiFi single-interface file
                 else if (!rf.received_data_wifi_file.empty())
                 {
-                    const auto &data = rf.received_data_wifi_file;
-                    size_t sent_back_pos = filename.find("sent_back=");
-                    if (sent_back_pos != std::string::npos)
-                    {
-                        std::string actual_filename = filename.substr(sent_back_pos + 10);
-                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
-                        if (write_raw(save_path, data))
-                            std::cout << "WiFi sent_back saved to RESULTS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                        else
-                            std::cerr << "Failed to save WiFi sent_back: " << save_path << std::endl;
-                    }
-                    else
-                    {
-                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
-                        if (write_raw(save_path, data))
-                            std::cout << "WiFi saved to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
-                        else
-                            std::cerr << "Failed to save WiFi file: " << save_path << std::endl;
-                    }
+                    process_payload(filename, rf.received_data_wifi_file);
                 }
                 else
                 {
                     std::cout << "Skipping empty ReservedFiles entry for: " << filename << std::endl;
-                }
-
-                // Python `cluster_matrix_v1.py` expects the ACK message to match the saved filename
-                // (e.g. `small_matrixA.bin`) for stream transfers.
-                if (local_IP_eth != head_node_ip_eth)
-                {
-                    const bool is_sent_back = filename.rfind("sent_back=", 0) == 0;
-                    if (!is_sent_back)
-                    {
-                        send_ack(filename);
-                    }
                 }
             }
 
@@ -1479,7 +1743,6 @@ class llama_zmq_server
             return false;
         }
 
-	        //NEW CODE START
 	    bool stream_matrix_binary(
 	        zmq::socket_t& out_socket,
 	        std::mutex& out_socket_mutex,
@@ -1562,7 +1825,6 @@ class llama_zmq_server
 
             return true;
         }
-        //NEW CODE END
 
         bool handle_combine_matrix_shard_list(
             const std::string& filename,
@@ -1689,12 +1951,55 @@ class llama_zmq_server
                     {
                         bool is_system2 = combined.is_system2;
 
-                        std::cout << "DEBUG: ALL SHARDS RECEIVED! Combining..."
-                                << std::endl;
+                        std::cout << "DEBUG: ALL SHARDS RECEIVED!" << std::endl;
 
-                        MatrixResult full = is_system2
-                            ? combine_matrix_shards_grid_2d(combined)
-                            : combine_matrix_shards_2d(combined);
+                        auto shard_bytes_to_result = [](const std::vector<uint8_t>& bytes) -> MatrixResult {
+                            MatrixResult out;
+                            if (bytes.size() < static_cast<size_t>(5 * sizeof(int))) {
+                                return out;
+                            }
+                            int dtype_tag = 0;
+                            int dims[4] = {0, 0, 0, 0};
+                            std::memcpy(&dtype_tag, bytes.data(), sizeof(int));
+                            std::memcpy(&dims[0], bytes.data() + sizeof(int), 4 * sizeof(int));
+                            if (dtype_tag != -1) {
+                                throw std::runtime_error("single-shard fast-path expects float32 v2 shard (dtype_tag=-1)");
+                            }
+
+                            const size_t numel =
+                                static_cast<size_t>(dims[0]) * static_cast<size_t>(dims[1]) *
+                                static_cast<size_t>(dims[2]) * static_cast<size_t>(dims[3]);
+                            const size_t need_bytes = static_cast<size_t>(5 * sizeof(int)) + numel * sizeof(float);
+                            if (bytes.size() < need_bytes) {
+                                throw std::runtime_error("single-shard fast-path payload truncated");
+                            }
+
+                            out.dims[0] = dims[0];
+                            out.dims[1] = dims[1];
+                            out.dims[2] = dims[2];
+                            out.dims[3] = dims[3];
+                            out.data = std::make_unique<float[]>(numel);
+                            std::memcpy(out.data.get(), bytes.data() + 5 * sizeof(int), numel * sizeof(float));
+                            return out;
+                        };
+
+                        MatrixResult full;
+                        if (needed == 1)
+                        {
+                            std::cout << "DEBUG: Single-shard result → stream directly (no combine)" << std::endl;
+                            if (combined.received_matrix_data.empty()) {
+                                std::cerr << "ERROR: No shard data for single-shard result: " << matrix_name << std::endl;
+                            } else {
+                                full = shard_bytes_to_result(combined.received_matrix_data.front());
+                            }
+                        }
+                        else
+                        {
+                            std::cout << "DEBUG: Combining shards..." << std::endl;
+                            full = is_system2
+                                ? combine_matrix_shards_grid_2d(combined)
+                                : combine_matrix_shards_2d(combined);
+                        }
 
 	                        if (full.data)
 	                        {
@@ -1756,6 +2061,61 @@ class llama_zmq_server
             combined.total_shards_reserved = 1;
             combined.is_system2 = (total_shards < 0);
             combined.output_dtype_tag = merge_output_dtype_tag(combined.output_dtype_tag, output_dtype_tag);
+
+            if (shards_needed == 1)
+            {
+                std::cout << "Single-shard result → stream directly (no combine/tracking)" << std::endl;
+
+                auto shard_bytes_to_result = [](const std::vector<uint8_t>& bytes) -> MatrixResult {
+                    MatrixResult out;
+                    if (bytes.size() < static_cast<size_t>(5 * sizeof(int))) {
+                        return out;
+                    }
+                    int dtype_tag = 0;
+                    int dims[4] = {0, 0, 0, 0};
+                    std::memcpy(&dtype_tag, bytes.data(), sizeof(int));
+                    std::memcpy(&dims[0], bytes.data() + sizeof(int), 4 * sizeof(int));
+                    if (dtype_tag != -1) {
+                        throw std::runtime_error("single-shard fast-path expects float32 v2 shard (dtype_tag=-1)");
+                    }
+
+                    const size_t numel =
+                        static_cast<size_t>(dims[0]) * static_cast<size_t>(dims[1]) *
+                        static_cast<size_t>(dims[2]) * static_cast<size_t>(dims[3]);
+                    const size_t need_bytes = static_cast<size_t>(5 * sizeof(int)) + numel * sizeof(float);
+                    if (bytes.size() < need_bytes) {
+                        throw std::runtime_error("single-shard fast-path payload truncated");
+                    }
+
+                    out.dims[0] = dims[0];
+                    out.dims[1] = dims[1];
+                    out.dims[2] = dims[2];
+                    out.dims[3] = dims[3];
+                    out.data = std::make_unique<float[]>(numel);
+                    std::memcpy(out.data.get(), bytes.data() + 5 * sizeof(int), numel * sizeof(float));
+                    return out;
+                };
+
+                MatrixResult full = shard_bytes_to_result(shard_bytes);
+                if (full.data)
+                {
+                    const bool sent = send_combined_bin_to_python(
+                        matrix_name,
+                        full,
+                        combined.output_dtype_tag
+                    );
+                    if (!sent) {
+                        std::cerr << "ERROR: Failed to stream combined PT for " << matrix_name << std::endl;
+                    }
+                    send_ack("ACK_combined_matrix_saved");
+                }
+                else
+                {
+                    std::cerr << "ERROR: Single-shard stream failed for " << matrix_name << std::endl;
+                }
+
+                return true;
+            }
 
             combined.shard_numbers.push_back(shard_num);
             combined.received_matrix_data.push_back(std::move(shard_bytes));
@@ -2093,9 +2453,9 @@ class llama_zmq_server
 
         bool matrix_operation(
             const std::string& backend_type,
-            const char* matrix_pathA,
+            const matrix_shard_object& matrixA,
             bool transposeA,
-            const char* matrix_pathB,
+            const matrix_shard_object& matrixB,
             bool transposeB,
             bool use_gpu,
             int gpu_id,
@@ -2110,7 +2470,7 @@ class llama_zmq_server
                 std::cout << "🚀 UNIFIED MATRIX OPERATION - Backend: " << backend_type << std::endl;
 
                 // Common setup (all backends)
-                std::string output_filename = get_matrix_output_filename(matrix_pathA, matrix_pathB);
+                std::string output_filename = get_matrix_output_filename(matrixA.base_file_name, matrixB.base_file_name);
                 if (shard_index_override >= 0)
                 {
                     // Force shard naming from caller
@@ -2124,69 +2484,134 @@ class llama_zmq_server
                     }
                     output_filename = base_name + "_shard_" + std::to_string(shard_index_override) + ".bin";
                 }
-                std::string output_path = std::filesystem::path(matrix_shard_folder) / output_filename;
 
-                // Determine output dtype tag from input file headers (v2 dtype_tag or legacy float32).
-                const int dtype_tag_A = read_dtype_tag_from_bin_file(matrix_pathA);
-                const int dtype_tag_B = read_dtype_tag_from_bin_file(matrix_pathB);
-                const int output_dtype_tag = merge_output_dtype_tag(dtype_tag_A, dtype_tag_B);
+                // Determine output dtype tag from in-memory inputs.
+                const int output_dtype_tag = merge_output_dtype_tag(matrixA.output_dtype_tag, matrixB.output_dtype_tag);
 
                 // ============================================================
                 // BACKEND: LLAMA / GGML / VULKAN
                 // ============================================================
-                if (backend_type == "llama")
-                {
-                    std::unique_ptr<float[]> matrix_A = nullptr;
-                    std::unique_ptr<float[]> matrix_B = nullptr;
-                    int rows_A, cols_A, rows_B, cols_B;
-                    int depthA = 1, batchA = 1;
-                    int depthB = 1, batchB = 1;
+	                if (backend_type == "llama")
+	                {
+	                    int rows_A = matrixA.rows_A;
+	                    int cols_A = matrixA.cols_A;
+	                    int batchA = matrixA.batchA;
+	                    int depthA = matrixA.depthA;
+	                    int rows_B = matrixB.rows_A;
+	                    int cols_B = matrixB.cols_A;
+	                    int batchB = matrixB.batchA;
+	                    int depthB = matrixB.depthA;
 
-                    // Load matrices
-                    matrix_A = load_matrix_bin(matrix_pathA, rows_A, cols_A, batchA, depthA);
-                    matrix_B = load_matrix_bin(matrix_pathB, rows_B, cols_B, batchB, depthB);
-                    
-                    if (!matrix_A || !matrix_B) {
-                        std::cerr << "❌ Failed to load input matrices" << std::endl;
-                        return false;
-                    }
+	                    if (!matrixA.data || !matrixB.data) {
+	                        throw std::runtime_error("Missing matrix data for llama backend inputs");
+	                    }
 
-                    // Apply transposes
-                    if (transposeA) {
-                        matrix_A = (depthA > 1 || batchA > 1)
-                            ? matrix_backend_llama.transpose_4d(matrix_A.get(), batchA, depthA, rows_A, cols_A)
-                            : matrix_backend_llama.transpose_2d(matrix_A.get(), rows_A, cols_A);
-                        std::swap(rows_A, cols_A);
-                    }
-                    
-                    if (transposeB) {
-                        matrix_B = (depthB > 1 || batchB > 1)
-                            ? matrix_backend_llama.transpose_4d(matrix_B.get(), batchB, depthB, rows_B, cols_B)
-                            : matrix_backend_llama.transpose_2d(matrix_B.get(), rows_B, cols_B);
-                        std::swap(rows_B, cols_B);
-                    }
+	                    // Only lock long enough to read the backend vector; release before compute
+	                    ggml_backend_t backend;
+	                    {
+	                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+	                        backend =
+	                            (use_gpu && gpu_id >= 0 &&
+	                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+	                            ? matrix_backend_llama.ggml_backends[gpu_id]
+	                            : matrix_backend_llama.ggml_backends.back();
+	                    }
 
-                    // GGML format: {cols, rows, depth, batch}
-                    int dims_a[4] = { cols_A, rows_A, depthA, batchA };
-                    int dims_b[4] = { cols_B, rows_B, depthB, batchB };
+	                    MatrixResult result;
+	                    result.dims[0] = result.dims[1] = result.dims[2] = result.dims[3] = 0;
 
-                    // Only lock long enough to read the backend vector; release before compute
-                    ggml_backend_t backend;
-                    {
-                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
-                        backend =
-                            (use_gpu && gpu_id >= 0 &&
-                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
-                            ? matrix_backend_llama.ggml_backends[gpu_id]
-                            : matrix_backend_llama.ggml_backends.back();
-                    }
+	                    // Fast path: use cached GGML tensors in VRAM when requested and possible.
+	                    const bool can_use_vram =
+	                        use_gpu &&
+	                        !transposeA &&
+	                        !transposeB &&
+	                        gpu_id >= 0 &&
+	                        gpu_id < (int)matrix_backend_llama.ggml_backends.size();
 
-                    // Execute
-                    MatrixResult result = matrix_backend_llama.matrix_op_nd(
-                        matrix_A.get(), dims_a,
-                        matrix_B.get(), dims_b,
-                        backend, operation_type
-                    );
+	                    if (can_use_vram) {
+	                        auto& vram = get_vram_cache_manager();
+	                        if (vram.enabled(gpu_id)) {
+	                            if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
+	                                vram.cache_tensor_f32_4d(
+	                                    gpu_id,
+	                                    matrixA.base_file_name,
+	                                    matrixA.data->data(),
+	                                    cols_A,
+	                                    rows_A,
+	                                    depthA,
+	                                    batchA
+	                                );
+	                            }
+	                            if (!vram.get_tensor(gpu_id, matrixB.base_file_name)) {
+	                                vram.cache_tensor_f32_4d(
+	                                    gpu_id,
+	                                    matrixB.base_file_name,
+	                                    matrixB.data->data(),
+	                                    cols_B,
+	                                    rows_B,
+	                                    depthB,
+	                                    batchB
+	                                );
+	                            }
+
+	                            ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
+	                            ggml_tensor* b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
+	                            if (a_t && b_t) {
+	                                result = matrix_backend_llama.matrix_op_nd_tensors(a_t, b_t, backend, operation_type);
+	                            }
+	                        }
+	                    }
+
+	                    // Fallback: host path (still runs on GPU if requested)
+	                    if (!result.data) {
+	                        const float* a_ptr = matrixA.data->data();
+	                        const float* b_ptr = matrixB.data->data();
+	                        std::unique_ptr<float[]> a_tmp;
+	                        std::unique_ptr<float[]> b_tmp;
+
+	                        if (transposeA) {
+	                            a_tmp = (depthA > 1 || batchA > 1)
+	                                ? matrix_backend_llama.transpose_4d(const_cast<float*>(a_ptr), batchA, depthA, rows_A, cols_A)
+	                                : matrix_backend_llama.transpose_2d(const_cast<float*>(a_ptr), rows_A, cols_A);
+	                            a_ptr = a_tmp.get();
+	                            std::swap(rows_A, cols_A);
+	                        }
+
+	                        if (transposeB) {
+	                            b_tmp = (depthB > 1 || batchB > 1)
+	                                ? matrix_backend_llama.transpose_4d(const_cast<float*>(b_ptr), batchB, depthB, rows_B, cols_B)
+	                                : matrix_backend_llama.transpose_2d(const_cast<float*>(b_ptr), rows_B, cols_B);
+	                            b_ptr = b_tmp.get();
+	                            std::swap(rows_B, cols_B);
+	                        }
+
+	                        int dims_a[4] = { cols_A, rows_A, depthA, batchA };
+	                        int dims_b[4] = { cols_B, rows_B, depthB, batchB };
+
+		                        result = matrix_backend_llama.matrix_op_nd(
+		                            const_cast<float*>(a_ptr), dims_a,
+		                            const_cast<float*>(b_ptr), dims_b,
+		                            backend, operation_type
+		                        );
+
+		                        // If GPU compute fails (often due to VRAM pressure), retry on CPU backend.
+		                        if (!result.data && use_gpu) {
+		                            ggml_backend_t cpu_backend;
+		                            {
+		                                std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+		                                cpu_backend = matrix_backend_llama.ggml_backends.back();
+		                            }
+		                            result = matrix_backend_llama.matrix_op_nd(
+		                                const_cast<float*>(a_ptr), dims_a,
+		                                const_cast<float*>(b_ptr), dims_b,
+		                                cpu_backend, operation_type
+		                            );
+		                        }
+		                    }
+
+		                    if (!result.data) {
+		                        throw std::runtime_error("GGML operation failed (no result data) for output: " + output_filename);
+		                    }
 
                     if (result.dims[0] == 0 && result.dims[1] == 0) {
                         result.dims[0] = 1;
@@ -2197,17 +2622,15 @@ class llama_zmq_server
 	                    // `send_back == 0`  => no combine, just save
 	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
 	                    op_success = false;
+                        store_matrix_result_to_shard_list(output_filename, result, output_dtype_tag);
 	                    if (send_back != 0)
 	                    {
-	                        send_back_file(output_path, output_filename, result, send_back, "llama", output_dtype_tag);
+	                        send_back_file(output_filename, output_filename, result, send_back, "llama", output_dtype_tag);
 	                        op_success = true;  // assume success for now
 	                    }
 	                    else
 	                    {
-	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-	                            op_success = true;
-	                        else
-	                            std::cerr << "❌ Failed to save result" << std::endl;
+                            op_success = true;
 	                    }
 
                 }
@@ -2227,15 +2650,24 @@ class llama_zmq_server
                         std::cout << "⚠️  GPU requested but unavailable. Using CPU." << std::endl;
                     }
 
-                    // Load tensors
-                    torch::Tensor A = load_matrix_bin_as_torch_view(matrix_pathA);
-                    torch::Tensor B = load_matrix_bin_as_torch_view(matrix_pathB);
-                    
-                    if (!A.defined() || !B.defined()) {
-                        std::cerr << "❌ Failed to load matrices" << std::endl;
-                        op_success = false;
-                        throw std::runtime_error("load fail");
-                    }
+	                    auto to_torch = [](const matrix_shard_object& obj) -> torch::Tensor {
+	                        if (!obj.data) {
+	                            throw std::runtime_error("Missing matrix data for torch backend input: " + obj.base_file_name);
+	                        }
+	                        std::vector<int64_t> sizes;
+	                        if (obj.batchA > 1 && obj.depthA > 1) {
+	                            sizes = {obj.batchA, obj.depthA, obj.rows_A, obj.cols_A};
+	                        } else if (obj.batchA > 1) {
+	                            sizes = {obj.batchA, obj.rows_A, obj.cols_A};
+	                        } else {
+	                            sizes = {obj.rows_A, obj.cols_A};
+	                        }
+	                        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	                        return torch::from_blob((void*)obj.data->data(), sizes, options).clone();
+	                    };
+
+                    torch::Tensor A = to_torch(matrixA);
+                    torch::Tensor B = to_torch(matrixB);
 
                     // Apply transposes (last 2 dims)
                     if (transposeA)
@@ -2296,17 +2728,15 @@ class llama_zmq_server
 	                    // `send_back == 0`  => no combine, just save
 	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
 	                    op_success = false;
+                        store_matrix_result_to_shard_list(output_filename, result, output_dtype_tag);
 	                    if (send_back != 0)
 	                    {
-	                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+	                        send_back_file(output_filename, output_filename, result, send_back, "torch", output_dtype_tag);
 	                        op_success = true;  // assume success for now
 	                    }
 	                    else
 	                    {
-	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-	                            op_success = true;
-	                        else
-	                            std::cerr << "❌ Failed to save result" << std::endl;
+                            op_success = true;
 	                    }
                 }
 
@@ -2320,14 +2750,24 @@ class llama_zmq_server
                         return false;
                     }
 
-                    // Load via Torch (I/O only)
-                    torch::Tensor tensorA = load_matrix_bin_as_torch_view(matrix_pathA);
-                    torch::Tensor tensorB = load_matrix_bin_as_torch_view(matrix_pathB);
+	                    auto to_torch = [](const matrix_shard_object& obj) -> torch::Tensor {
+	                        if (!obj.data) {
+	                            throw std::runtime_error("Missing matrix data for opencl backend input: " + obj.base_file_name);
+	                        }
+	                        std::vector<int64_t> sizes;
+	                        if (obj.batchA > 1 && obj.depthA > 1) {
+	                            sizes = {obj.batchA, obj.depthA, obj.rows_A, obj.cols_A};
+	                        } else if (obj.batchA > 1) {
+	                            sizes = {obj.batchA, obj.rows_A, obj.cols_A};
+	                        } else {
+	                            sizes = {obj.rows_A, obj.cols_A};
+	                        }
+	                        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	                        return torch::from_blob((void*)obj.data->data(), sizes, options).clone();
+	                    };
 
-                    if (!tensorA.defined() || !tensorB.defined()) {
-                        std::cerr << "❌ Failed to load matrices" << std::endl;
-                        return false;
-                    }
+                    torch::Tensor tensorA = to_torch(matrixA);
+                    torch::Tensor tensorB = to_torch(matrixB);
 
                     // Apply transposes
                     if (transposeA)
@@ -2384,17 +2824,15 @@ class llama_zmq_server
 	                    // `send_back == 0`  => no combine, just save
 	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
 	                    op_success = false;
+                        store_matrix_result_to_shard_list(output_filename, result, output_dtype_tag);
 	                    if (send_back != 0)
 	                    {
-	                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+	                        send_back_file(output_filename, output_filename, result, send_back, "opencl", output_dtype_tag);
 	                        op_success = true;  // assume success for now
 	                    }
 	                    else
 	                    {
-	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-	                            op_success = true;
-	                        else
-	                            std::cerr << "❌ Failed to save result" << std::endl;
+                            op_success = true;
 	                    }
                 }
 
@@ -2411,7 +2849,6 @@ class llama_zmq_server
             try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
             return op_success;
         }
-
 };
 
 int main()
@@ -2491,9 +2928,9 @@ int main()
 /*
 int main()
 {
-    const char* path_to_B_shard_1 = "/dev/shm/matrix_shards/test_2d_a_shard_1.bin";
-    const char* path_to_A        = "/dev/shm/matrix_shards/test_2d_a.bin";
-    const char* path_to_B        = "/dev/shm/matrix_shards/test_2d_a.bin";
+    const char* path_to_B_shard_1 = "matrix_shards/test_2d_a_shard_1.bin";
+    const char* path_to_A        = "matrix_shards/test_2d_a.bin";
+    const char* path_to_B        = "matrix_shards/test_2d_a.bin";
 
     llama_matrix_backend server;
     {
@@ -2526,8 +2963,8 @@ int main()
         std::cout << "Original B (full): " << rows_B << "x" << cols_B << std::endl;
         std::cout << "Original B (shard_1): " << rows_B_shard_1 << "x" << cols_B_shard_1 << std::endl;
 
-        //print_bin_from_torch("/dev/shm/matrix_shards/test_2d_a_shard_1.bin",10,10);
-        //print_bin_from_torch("/dev/shm/matrix_shards/test_2d_a.bin",10,10);
+        //print_bin_from_torch("matrix_shards/test_2d_a_shard_1.bin",10,10);
+        //print_bin_from_torch("matrix_shards/test_2d_a.bin",10,10);
 
 
 
@@ -2538,8 +2975,8 @@ int main()
                 matrix_B_shard_1.get(), dims2d_b_shard_1,
                 server.ggml_backends[0], "mul"
             );
-            save_matrix_bin("/dev/shm/matrix_shards/shard_AB_out.bin",r);
-            torch::Tensor shard_AB = load_matrix_bin_as_torch_view("/dev/shm/matrix_shards/shard_AB_out.bin");
+            save_matrix_bin("matrix_shards/shard_AB_out.bin",r);
+            torch::Tensor shard_AB = load_matrix_bin_as_torch_view("matrix_shards/shard_AB_out.bin");
             std::cout << "\nSHARD A@B flat:\n";
             print_tensor_start_flat(shard_AB, "fuck" ,40);
         }

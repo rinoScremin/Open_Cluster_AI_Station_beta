@@ -19,6 +19,7 @@
 #include <mutex>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
 #include <sys/mman.h>
 
 
@@ -1113,7 +1114,379 @@ class llama_matrix_backend
 
             return output;  
         }
+
+        // Variant: operate using pre-existing GGML tensors (e.g. cached in VRAM).
+        // The input tensors must already be initialized on the target backend.
+        MatrixResult matrix_op_nd_tensors(
+            struct ggml_tensor* a,
+            struct ggml_tensor* b,
+            ggml_backend_t backend,
+            const std::string& op = "mul")
+        {
+            stat_ops.fetch_add(1, std::memory_order_relaxed);
+
+            if (!a || !b) {
+                std::cerr << "Error: matrix_op_nd_tensors got null input tensor(s)" << std::endl;
+                return {nullptr, {0, 0, 0, 0}};
+            }
+
+            int backend_index = -1;
+            if (!backend) {
+                backend = pick_least_loaded_backend();
+            }
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {
+                if (ggml_backends[bi] == backend) {
+                    backend_index = (int) bi;
+                    break;
+                }
+            }
+
+            ggml_init_params params;
+            params.mem_size = 16 * 1024 * 1024;
+            params.mem_buffer = NULL;
+            params.no_alloc = false;
+            struct ggml_context* ctx = ggml_init(params);
+            if (!ctx) {
+                std::cerr << "Error: ggml_init failed in matrix_op_nd_tensors" << std::endl;
+                return {nullptr, {0, 0, 0, 0}};
+            }
+
+            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };
+            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);
+
+            struct ggml_tensor* result = nullptr;
+            if (op == "mul") {
+                result = ggml_mul_mat(ctx, a, b);
+            } else if (op == "add") {
+                result = ggml_add(ctx, a, b);
+            } else if (op == "sub") {
+                result = ggml_sub(ctx, a, b);
+            } else {
+                std::cerr << "Error: Unsupported op in matrix_op_nd_tensors: " << op << std::endl;
+                return {nullptr, {0, 0, 0, 0}};
+            }
+
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, result);
+
+            std::unique_lock<std::mutex> device_lock;
+            bool incremented_load = false;
+            if (backend_index >= 0 && backend_index < (int) device_mutexes.size()) {
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);
+                if (backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);
+                    incremented_load = true;
+                }
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) {
+                if (incremented_load && backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
+                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
+                }
+                return {nullptr, {0, 0, 0, 0}};
+            }
+
+            ggml_backend_graph_compute(backend, gf);
+
+            MatrixResult output;
+            const int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];
+            output.data = std::make_unique<float[]>(total_result);
+
+            output.dims[0] = result->ne[3]; // batch
+            output.dims[1] = result->ne[2]; // depth
+            output.dims[2] = result->ne[1]; // rows
+            output.dims[3] = result->ne[0]; // cols
+
+            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);
+
+            ggml_backend_buffer_free(buf);
+            if (incremented_load && backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
+                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (device_lock.owns_lock()) device_lock.unlock();
+
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);
+            return output;
+        }
 };
+
+// =====================================================================================
+// VRAM buffer/cache setup (best-effort, backend-agnostic via GGML backends)
+// =====================================================================================
+
+struct vram_tensor_entry {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_context* ctx = nullptr;
+    struct ggml_tensor* tensor = nullptr;
+    size_t alloc_bytes = 0;
+    int dims[4] = {0, 0, 0, 0}; // {cols, rows, depth, batch} in GGML order
+};
+
+struct vram_backend_state {
+    bool enabled = false;
+    size_t budget_bytes = 0;
+    size_t used_bytes = 0;
+    ggml_backend_buffer_t scratch = nullptr;
+    size_t scratch_bytes = 0;
+};
+
+class vram_cache_manager {
+public:
+    void init(const std::vector<ggml_backend_t>& backends_in) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (initialized) return;
+        backends = backends_in;
+        states.assign(backends.size(), vram_backend_state{});
+        initialized = true;
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto& kv : cache) {
+            if (kv.second.buffer) ggml_backend_buffer_free(kv.second.buffer);
+            if (kv.second.ctx) ggml_free(kv.second.ctx);
+        }
+        cache.clear();
+
+        for (auto& st : states) {
+            if (st.scratch) ggml_backend_buffer_free(st.scratch);
+            st.scratch = nullptr;
+            st.enabled = false;
+            st.budget_bytes = 0;
+            st.used_bytes = 0;
+            st.scratch_bytes = 0;
+        }
+
+        initialized = false;
+    }
+
+    void configure_defaults() {
+        std::lock_guard<std::mutex> lock(mtx);
+        const size_t budget_mb = env_size_mb("OPEN_CLUSTER_VRAM_CACHE_MB", 0);
+        const size_t reserve_mb = env_size_mb("OPEN_CLUSTER_VRAM_RESERVE_MB", 2048);
+        const size_t scratch_mb = env_size_mb("OPEN_CLUSTER_VRAM_SCRATCH_MB", 64);
+
+        const size_t reserve_bytes = reserve_mb * 1024ull * 1024ull;
+
+        const size_t scratch_bytes = scratch_mb * 1024ull * 1024ull;
+
+        for (size_t i = 0; i < states.size(); ++i) {
+            ggml_backend_t backend = backends[i];
+            const std::string name = backend_name(i, backend);
+            ggml_backend_buffer_type_t buft = backend ? ggml_backend_get_default_buffer_type(backend) : nullptr;
+            const bool is_host = buft ? ggml_backend_buft_is_host(buft) : true;
+
+            // Per-backend budget selection:
+            // - If OPEN_CLUSTER_VRAM_CACHE_MB is set, use it for every non-host backend.
+            // - Else, derive from backend-reported max size minus reserve.
+            const size_t backend_max = backend ? ggml_backend_get_max_size(backend) : 0;
+            size_t budget_bytes = 0;
+            if (budget_mb > 0) {
+                budget_bytes = budget_mb * 1024ull * 1024ull;
+            } else if (backend_max > reserve_bytes) {
+                budget_bytes = backend_max - reserve_bytes;
+            }
+
+            states[i].enabled = (!is_host) && (budget_bytes > 0);
+            states[i].budget_bytes = budget_bytes;
+            states[i].used_bytes = 0;
+            states[i].scratch_bytes = 0;
+            states[i].scratch = nullptr;
+
+            if (!states[i].enabled) continue;
+            if (!backend) { states[i].enabled = false; continue; }
+
+            if (scratch_bytes > 0) {
+                ggml_backend_buffer_t scratch = ggml_backend_alloc_buffer(backend, scratch_bytes);
+                if (scratch) {
+                    states[i].scratch = scratch;
+                    states[i].scratch_bytes = scratch_bytes;
+                } else {
+                    // If scratch alloc fails, keep caching disabled for safety.
+                    states[i].enabled = false;
+                }
+            }
+        }
+    }
+
+    bool enabled(int backend_index) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return initialized &&
+            backend_index >= 0 &&
+            backend_index < (int) states.size() &&
+            states[(size_t) backend_index].enabled;
+    }
+
+    size_t budget_bytes(int backend_index) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (backend_index < 0 || backend_index >= (int) states.size()) return 0;
+        return states[(size_t) backend_index].budget_bytes;
+    }
+
+    size_t used_bytes(int backend_index) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (backend_index < 0 || backend_index >= (int) states.size()) return 0;
+        return states[(size_t) backend_index].used_bytes;
+    }
+
+    size_t free_budget_bytes(int backend_index) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (backend_index < 0 || backend_index >= (int) states.size()) return 0;
+        const auto& st = states[(size_t) backend_index];
+        if (!st.enabled) return 0;
+        const size_t used = st.used_bytes + st.scratch_bytes;
+        return (st.budget_bytes > used) ? (st.budget_bytes - used) : 0;
+    }
+
+    ggml_tensor* get_tensor(int backend_index, const std::string& name) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = cache.find(make_key(backend_index, name));
+        if (it == cache.end()) return nullptr;
+        return it->second.tensor;
+    }
+
+    bool cache_tensor_f32_4d(
+        int backend_index,
+        const std::string& name,
+        const float* data,
+        int cols,
+        int rows,
+        int depth,
+        int batch)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!initialized || backend_index < 0 || backend_index >= (int) states.size()) return false;
+        if (!states[(size_t) backend_index].enabled) return false;
+        if (!data) return false;
+
+        const std::string key = make_key(backend_index, name);
+        if (cache.find(key) != cache.end()) {
+            return true; // already cached
+        }
+
+        ggml_backend_t backend = backends[(size_t) backend_index];
+        if (!backend) return false;
+
+        // Build a dedicated context for this cached tensor (kept alive until shutdown).
+        ggml_init_params params;
+        params.mem_size = 4 * 1024 * 1024;
+        params.mem_buffer = NULL;
+        params.no_alloc = true;
+        ggml_context* ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        ggml_tensor* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cols, rows, depth, batch);
+        if (!t) {
+            ggml_free(ctx);
+            return false;
+        }
+
+        const size_t payload_bytes = ggml_nbytes(t);
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        const size_t alloc_bytes = ggml_backend_buft_get_alloc_size(buft, t);
+
+        const size_t used_now = states[(size_t) backend_index].used_bytes + states[(size_t) backend_index].scratch_bytes;
+        if (alloc_bytes == 0 || states[(size_t) backend_index].budget_bytes <= used_now || alloc_bytes > (states[(size_t) backend_index].budget_bytes - used_now)) {
+            ggml_free(ctx);
+            return false;
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, alloc_bytes);
+        if (!buf) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // Attach tensor to the backend buffer (sets tensor->buffer and tensor->data).
+        // Without this, `ggml_backend_tensor_set()` will assert "tensor buffer not set".
+        void* base = ggml_backend_buffer_get_base(buf);
+        const ggml_status st = ggml_backend_tensor_alloc(buf, t, base);
+        if (st != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+
+        ggml_backend_tensor_set(t, data, 0, payload_bytes);
+
+        vram_tensor_entry entry;
+        entry.backend = backend;
+        entry.buffer = buf;
+        entry.ctx = ctx;
+        entry.tensor = t;
+        entry.alloc_bytes = alloc_bytes;
+        entry.dims[0] = cols;
+        entry.dims[1] = rows;
+        entry.dims[2] = depth;
+        entry.dims[3] = batch;
+
+        cache.emplace(key, entry);
+        states[(size_t) backend_index].used_bytes += alloc_bytes;
+        return true;
+    }
+
+private:
+    static size_t env_size_mb(const char* key, size_t def_mb) {
+        const char* v = std::getenv(key);
+        if (!v || !*v) return def_mb;
+        try {
+            return std::stoull(v);
+        } catch (...) {
+            return def_mb;
+        }
+    }
+
+    static std::string backend_name(size_t idx, ggml_backend_t backend) {
+        (void) idx;
+        if (!backend) return "";
+        const char* n = ggml_backend_name(backend);
+        return n ? std::string(n) : std::string();
+    }
+
+    static bool is_cpu_backend(const std::string& name) {
+        const auto lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            return s;
+        };
+        std::string n = lower(name);
+        return (n.find("cpu") != std::string::npos);
+    }
+
+    static std::string make_key(int backend_index, const std::string& name) {
+        return std::to_string(backend_index) + "|" + name;
+    }
+
+    mutable std::mutex mtx;
+    bool initialized = false;
+    std::vector<ggml_backend_t> backends;
+    std::vector<vram_backend_state> states;
+    std::unordered_map<std::string, vram_tensor_entry> cache;
+};
+
+static inline vram_cache_manager& get_vram_cache_manager() {
+    static vram_cache_manager mgr;
+    return mgr;
+}
+
+static inline void set_VRAM_buffers(llama_matrix_backend& llama_backend) {
+    auto& mgr = get_vram_cache_manager();
+    mgr.init(llama_backend.ggml_backends);
+    mgr.configure_defaults();
+    // Ensure we always attempt to clean up even if server exits via std::exit().
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        std::atexit([]() {
+            try {
+                get_vram_cache_manager().shutdown();
+            } catch (...) {
+            }
+        });
+    }
+}
 
 /*
 int main() 
@@ -1121,16 +1494,16 @@ int main()
     std::cout << "Testing GGML matrix loading..." << std::endl;
     
     // 2D test files
-    const char* test_2d_a = "/dev/shm/matrix_shards/test_2d_a.bin";
-    const char* test_2d_b = "/dev/shm/matrix_shards/test_2d_b.bin";
+    const char* test_2d_a = "matrix_shards/test_2d_a.bin";
+    const char* test_2d_b = "matrix_shards/test_2d_b.bin";
     
     // 3D test files
-    const char* test_3d_a = "/dev/shm/matrix_shards/test_3d_a.bin";
-    const char* test_3d_b = "/dev/shm/matrix_shards/test_3d_b.bin";
+    const char* test_3d_a = "matrix_shards/test_3d_a.bin";
+    const char* test_3d_b = "matrix_shards/test_3d_b.bin";
     
     // 4D test files
-    const char* test_4d_a = "/dev/shm/matrix_shards/test_4d_a.bin";
-    const char* test_4d_b = "/dev/shm/matrix_shards/test_4d_b.bin";
+    const char* test_4d_a = "matrix_shards/test_4d_a.bin";
+    const char* test_4d_b = "matrix_shards/test_4d_b.bin";
     
     llama_matrix_backend server;
     
