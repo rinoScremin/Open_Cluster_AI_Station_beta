@@ -1,9 +1,8 @@
----
 NOTE: UPDATES IN PROGRESS!!
+---
 # 🚀 **Open Cluster AI Station – Mamba / GQA Multi-Node Setup**
 
 This README explains the commands to **download models, cache weights, and run distributed inference** across multiple nodes in your local network.
-
 ---
 
 ## 🔹 1️⃣ Downloading Mamba2 & GQA Models
