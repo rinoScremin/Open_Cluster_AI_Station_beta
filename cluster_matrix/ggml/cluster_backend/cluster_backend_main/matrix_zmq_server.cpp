@@ -29,41 +29,41 @@
 #include <algorithm>
 #include <cctype>
 #include <torch/torch.h>
+#include <unordered_map>
+#include <limits>
 
 
 struct combined_matrix_shards
 {
-    int total_shards_reserved = 0;        // Number of shards currently received
-    int number_of_shards_needed = 0;      // Total shards expected for this matrix
-    std::string file_name;                // Base filename (without shard index)
-    
-    std::vector<int> shard_numbers;       // List of received shard indices
-    std::list<std::vector<uint8_t>> received_matrix_data;  // Raw binary data of each shard
-    std::list<std::vector<int>> dims_list;                 // Dimensions of each shard [batch, depth, rows, cols]
-    
+    struct ShardView {
+        int rows = 0;
+        int cols = 0;
+        std::unique_ptr<float[]> data;
+    };
+
+    int total_shards_reserved = 0;   // Number of unique shards currently received
+    int number_of_shards_needed = 0; // Total shards expected for this matrix (0 until learned)
+    std::string file_name;           // Base filename (without shard index)
+
+    // Shards keyed by shard index (float32 payload).
+    std::unordered_map<int, ShardView> shards;
+
+    // Track index range to avoid sorting in combine when indices are contiguous.
+    int min_shard_index = 0;
+    int max_shard_index = -1;
+    bool have_index_range = false;
+
     // System marker:
     // - System 1: concatenate shards along join_dim
     // - System 2: 2D grid tile assembly
-    //
-    // IMPORTANT: some sent_back shards arrive via `save_file_handler()` which currently
-    // calls `handle_combine_matrix_shard_list(..., total_shards=0)`, so we must persist
-    // whether this matrix is System-2 when we first learn it (from any shard that carries
-    // the signed total_shards encoding).
     bool is_system2 = false;
 
     // Output dtype tag for the final combined matrix (v2 header):
     //   -1 = float32, -2 = float16, -3 = bfloat16
-    // This is derived from input dtypes and propagated from worker/head results.
     int output_dtype_tag = -1;
 
-    // Dedupe: avoid counting the same shard index twice if it is retransmitted.
-    std::set<int> received_shard_numbers;
-
-    int join_dim = 0; // << for now you only will join dim=0 but join based off this 
-    // Note: Using std::list for received data allows efficient insertion
-    //       as shards arrive in potentially non-sequential order from workers
+    int join_dim = 0; // 0 = rows, 1 = cols (for 2D outputs)
 };
-
 
 struct matrix_shard_object
 {
@@ -262,7 +262,9 @@ class llama_zmq_server
         // Central list that holds all incoming files (Ethernet, WiFi, parallel)
         std::vector<ReservedFiles> reserved_files_list;
 
-        std::vector<combined_matrix_shards> combined_matrix_shards_list;
+        // Track combine-in-progress results by base matrix name (e.g. "AxB").
+        std::unordered_map<std::string, combined_matrix_shards> combined_matrix_shards_map;
+        std::mutex combined_matrix_shards_mutex;
 
         // In your class member variables:
         std::vector<std::string> matrix_file_paths;
@@ -304,11 +306,11 @@ class llama_zmq_server
             return std::filesystem::path(path_or_name).filename().string();
         }
 
-        static bool decode_matrix_binary_payload(
-            const std::vector<uint8_t>& bytes,
-            matrix_shard_object& out,
-            const std::string& base_file_name
-        ) {
+	        static bool decode_matrix_binary_payload(
+	            const std::vector<uint8_t>& bytes,
+	            matrix_shard_object& out,
+	            const std::string& base_file_name
+	        ) {
             if (bytes.size() < 5 * sizeof(int)) {
                 std::cerr << "ERROR: Matrix payload too small for header: " << base_file_name << std::endl;
                 return false;
@@ -391,12 +393,100 @@ class llama_zmq_server
 	                }
 	            }
 
-            return true;
-        }
+	            return true;
+	        }
 
-        void upsert_matrix_shard_object(matrix_shard_object obj) {
-            const std::string key = normalize_matrix_key(obj.base_file_name);
-            obj.base_file_name = key;
+	        static bool decode_matrix_binary_payload_to_f32(
+	            const std::vector<uint8_t>& bytes,
+	            std::unique_ptr<float[]>& out_data,
+	            int& rows,
+	            int& cols,
+	            int& batch,
+	            int& depth,
+	            int& dtype_tag
+	        ) {
+	            if (bytes.size() < 5 * sizeof(int)) {
+	                std::cerr << "ERROR: Matrix payload too small for header" << std::endl;
+	                return false;
+	            }
+
+	            int tag_or_ndim = 0;
+	            std::memcpy(&tag_or_ndim, bytes.data(), sizeof(int));
+
+	            dtype_tag = -1; // legacy default float32
+	            int dims[4] = {1, 1, 1, 1}; // batch, depth, rows, cols
+	            int header_ints = 0;
+
+	            if (tag_or_ndim < 0) {
+	                dtype_tag = tag_or_ndim;
+	                header_ints = 5; // dtype_tag + 4 dims
+	                std::memcpy(&dims[0], bytes.data() + sizeof(int), 4 * sizeof(int));
+	            } else {
+	                const int ndim = tag_or_ndim;
+	                if (ndim != 2 && ndim != 3 && ndim != 4) {
+	                    std::cerr << "ERROR: Unsupported ndim=" << ndim << std::endl;
+	                    return false;
+	                }
+	                header_ints = 1 + ndim;
+	                std::vector<int> vdims((size_t)ndim);
+	                std::memcpy(vdims.data(), bytes.data() + sizeof(int), (size_t)ndim * sizeof(int));
+	                if (ndim == 2) {
+	                    dims[0] = 1; dims[1] = 1; dims[2] = vdims[0]; dims[3] = vdims[1];
+	                } else if (ndim == 3) {
+	                    dims[0] = vdims[0]; dims[1] = 1; dims[2] = vdims[1]; dims[3] = vdims[2];
+	                } else {
+	                    dims[0] = vdims[0]; dims[1] = vdims[1]; dims[2] = vdims[2]; dims[3] = vdims[3];
+	                }
+	            }
+
+	            if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+	                std::cerr << "ERROR: Unsupported dtype_tag=" << dtype_tag << std::endl;
+	                return false;
+	            }
+
+	            batch = dims[0];
+	            depth = dims[1];
+	            rows = dims[2];
+	            cols = dims[3];
+
+	            if (batch <= 0 || depth <= 0 || rows <= 0 || cols <= 0) {
+	                std::cerr << "ERROR: Invalid dims in payload: "
+	                          << batch << "," << depth << "," << rows << "," << cols << std::endl;
+	                return false;
+	            }
+
+	            const size_t total_elements =
+	                static_cast<size_t>(batch) * static_cast<size_t>(depth) *
+	                static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+	            const size_t header_bytes = static_cast<size_t>(header_ints) * sizeof(int);
+	            const size_t elem_bytes = (dtype_tag == -1) ? sizeof(float) : sizeof(uint16_t);
+	            const size_t need_bytes = header_bytes + total_elements * elem_bytes;
+	            if (bytes.size() < need_bytes) {
+	                std::cerr << "ERROR: Truncated payload"
+	                          << " need=" << need_bytes << " got=" << bytes.size() << std::endl;
+	                return false;
+	            }
+
+	            out_data = std::make_unique<float[]>(total_elements);
+
+	            const uint8_t* payload = bytes.data() + header_bytes;
+	            float* out_f32 = out_data.get();
+	            if (dtype_tag == -1) {
+	                std::memcpy(out_f32, payload, total_elements * sizeof(float));
+	            } else {
+	                const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload);
+	                for (size_t i = 0; i < total_elements; ++i) {
+	                    out_f32[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
+	                }
+	            }
+
+	            return true;
+	        }
+
+	        void upsert_matrix_shard_object(matrix_shard_object obj) {
+	            const std::string key = normalize_matrix_key(obj.base_file_name);
+	            obj.base_file_name = key;
 
             std::lock_guard<std::mutex> lock(matrix_shard_object_mutex);
             for (auto& existing : matrix_shard_object_list) {
@@ -620,16 +710,53 @@ class llama_zmq_server
             head_node_sender_wifi(zmq_context, zmq::socket_type::push),
             worker_peer_receiver(zmq_context, zmq::socket_type::pull),
             server_running(true)
-        {
+	        {
 
-            
-            // Load configuration from environment variables with defaults.
-            // Avoid hardcoding absolute paths; default to current working directory.
-            std::string default_project_folder = std::filesystem::current_path().string();
-            if (!default_project_folder.empty() && default_project_folder.back() != '/') {
-                default_project_folder.push_back('/');
-            }
-            project_folder = get_env("OPEN_CLUSTER_PROJECT_DIRECTORY", default_project_folder.c_str());
+	            
+	            // Load configuration from environment variables with defaults.
+	            // Try to infer the `cluster_matrix/` root so disk paths match the Python frontend
+	            // even when the server is launched from `cluster_matrix/ggml/`.
+	            const auto infer_default_project_folder = []() -> std::string {
+	                std::filesystem::path cwd;
+	                try {
+	                    cwd = std::filesystem::current_path();
+	                } catch (...) {
+	                    return std::string("./");
+	                }
+
+	                const auto normalize_dir = [](const std::filesystem::path& dir) -> std::string {
+	                    std::string out = dir.string();
+	                    if (!out.empty() && out.back() != '/') {
+	                        out.push_back('/');
+	                    }
+	                    return out;
+	                };
+
+	                std::filesystem::path probe = cwd;
+	                for (int i = 0; i < 8; ++i) {
+	                    // If launched from within `cluster_matrix/`, detect it directly.
+	                    if (std::filesystem::exists(probe / "cluster_matrix_v1.py")) {
+	                        return normalize_dir(probe);
+	                    }
+	                    // If launched from repo root (or elsewhere), detect the `cluster_matrix/` folder.
+	                    if (std::filesystem::exists(probe / "cluster_matrix" / "cluster_matrix_v1.py")) {
+	                        return normalize_dir(probe / "cluster_matrix");
+	                    }
+	                    if (!probe.has_parent_path()) {
+	                        break;
+	                    }
+	                    const std::filesystem::path parent = probe.parent_path();
+	                    if (parent == probe) {
+	                        break;
+	                    }
+	                    probe = parent;
+	                }
+
+	                return normalize_dir(cwd);
+	            };
+
+	            const std::string default_project_folder = infer_default_project_folder();
+	            project_folder = get_env("OPEN_CLUSTER_PROJECT_DIRECTORY", default_project_folder.c_str());
 
 
 
@@ -1522,9 +1649,9 @@ class llama_zmq_server
                 std::cout << "Processing: " << local_reserved_files.size() << " reserved file(s)" << std::endl;
             }
 
-	            auto process_payload = [&](const std::string& filename_in, const std::vector<uint8_t>& bytes) {
-	                std::string filename = normalize_matrix_key(filename_in);
-	                bool prefer_vram = false;
+			            auto process_payload = [&](const std::string& filename_in, const std::vector<uint8_t>& bytes) {
+			                std::string filename = normalize_matrix_key(filename_in);
+			                bool prefer_vram = false;
 	                const std::string vram_prefix = "VRAM|";
 	                if (filename.rfind(vram_prefix, 0) == 0) {
 	                    prefer_vram = true;
@@ -1532,46 +1659,61 @@ class llama_zmq_server
 	                }
 	                const bool is_sent_back = filename.rfind("sent_back=", 0) == 0 || filename.find("sent_back=") != std::string::npos;
 
-                if (is_sent_back)
-                {
-                    // Worker result shard streamed to head for combining.
-                    const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
-                    if (!is_head_node) {
-                        return;
-                    }
+	                if (is_sent_back)
+	                {
+	                    // Worker result shard streamed to head for combining.
+	                    const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
+	                    if (!is_head_node) {
+	                        return;
+	                    }
 
                     const size_t pos = filename.find("sent_back=");
-                    const std::string actual_filename = (pos == std::string::npos)
+                    std::string actual_filename = (pos == std::string::npos)
                         ? filename
                         : filename.substr(pos + 10);
 
-                    matrix_shard_object obj;
-                    if (!decode_matrix_binary_payload(bytes, obj, actual_filename)) {
-                        std::cerr << "ERROR: Failed to decode sent_back payload: " << actual_filename << std::endl;
-                        return;
+                    // Optional: parse send_back from header (`sent_back=<send_back>|<filename>`).
+                    // If absent (old workers), we fall back to `send_back=0` and will only
+                    // be able to combine once a local/head shard supplies the metadata.
+                    int send_back = 0;
+                    const size_t sep = actual_filename.find('|');
+                    if (sep != std::string::npos) {
+                        const std::string send_back_str = actual_filename.substr(0, sep);
+                        try {
+                            send_back = std::stoi(send_back_str);
+                        } catch (...) {
+                            send_back = 0;
+                        }
+                        actual_filename = actual_filename.substr(sep + 1);
                     }
 
-                    const int rows = obj.rows_A;
-	                    const int cols = obj.cols_A;
-	                    const size_t need = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-	                    auto shard_data = std::make_unique<float[]>(need);
-	                    if (!obj.data || obj.data->size() < need) {
-	                        std::cerr << "ERROR: Sent_back matrix data missing or truncated: " << actual_filename << std::endl;
+	                    std::unique_ptr<float[]> shard_data;
+	                    int rows = 0;
+	                    int cols = 0;
+	                    int batch = 1;
+	                    int depth = 1;
+	                    int dtype_tag = -1;
+	                    if (!decode_matrix_binary_payload_to_f32(bytes, shard_data, rows, cols, batch, depth, dtype_tag)) {
+	                        std::cerr << "ERROR: Failed to decode sent_back payload: " << actual_filename << std::endl;
 	                        return;
 	                    }
-	                    std::memcpy(shard_data.get(), obj.data->data(), need * sizeof(float));
+	                    if (batch != 1 || depth != 1) {
+	                        std::cerr << "ERROR: sent_back combine currently expects 2D (batch=1, depth=1) but got "
+	                                  << batch << "," << depth << " for " << actual_filename << std::endl;
+	                        return;
+	                    }
 
-                    handle_combine_matrix_shard_list(
-                        actual_filename,
-                        std::move(shard_data),
-                        rows,
-                        cols,
-                        0,
-                        obj.output_dtype_tag
-                    );
+	                    handle_combine_matrix_shard_list(
+	                        actual_filename,
+	                        std::move(shard_data),
+	                        rows,
+	                        cols,
+	                        send_back,
+	                        dtype_tag
+	                    );
 
-                    return;
-                }
+	                    return;
+	                }
 
 	                // Input matrices: keep fully in memory and ACK the sender.
 	                matrix_shard_object obj;
@@ -1653,7 +1795,7 @@ class llama_zmq_server
             std::cout << "Save file handler completed" << std::endl;
         }
 
-	    bool send_back_file(const std::string& local_file_path,
+	        bool send_back_file(const std::string& local_file_path,
 	                            const std::string& filename,
 	                            MatrixResult& save_result,
 	                            int total_shards,
@@ -1668,7 +1810,11 @@ class llama_zmq_server
             // ============================================================
 	            if (!is_head_node)
 	            {
-	                std::string send_back_filename = "sent_back=" + filename;
+	                // Include the `send_back` encoding in the header so the head node can
+	                // combine shards even when it doesn't compute a local shard.
+	                // Backwards compatible format: `sent_back=<send_back>|<filename>`.
+	                std::string send_back_filename =
+	                    "sent_back=" + std::to_string(total_shards) + "|" + filename;
 	                std::cout << "Worker streaming result back to head: "
 	                        << send_back_filename << std::endl;
 
@@ -1709,23 +1855,24 @@ class llama_zmq_server
             // ============================================================
             // HEAD NODE → SAVE FILE + TRACK SHARDS
             // ============================================================
-            if (is_head_node)
-            {
-                // Extract shard dimensions
-                int shard_rows = save_result.dims[2];
-                int shard_cols = save_result.dims[3];
-                size_t data_size = shard_rows * shard_cols * sizeof(float);
+	            if (is_head_node)
+	            {
+	                // Extract shard dimensions
+	                int shard_rows = save_result.dims[2];
+	                int shard_cols = save_result.dims[3];
+	                const size_t data_size = static_cast<size_t>(shard_rows) * static_cast<size_t>(shard_cols) * sizeof(float);
 
-                // Copy data into unique_ptr for shard processing
-                auto shard_data = std::make_unique<float[]>(shard_rows * shard_cols);
-                std::memcpy(shard_data.get(),
-                            save_result.data.get(),
-                            data_size);
+	                // Move shard buffer directly into combine path (avoid extra copy).
+	                auto shard_data = std::move(save_result.data);
+	                if (!shard_data) {
+	                    std::cerr << "ERROR: Missing shard data for send_back: " << filename << std::endl;
+	                    return false;
+	                }
 
 
-                std::cout << "**send_back_file** total_shards: " << total_shards;
-                // Process shard through combination handler
-                bool result = handle_combine_matrix_shard_list(
+	                std::cout << "**send_back_file** total_shards: " << total_shards;
+	                // Process shard through combination handler
+	                bool result = handle_combine_matrix_shard_list(
                     filename,
                     std::move(shard_data),
                     shard_rows,
@@ -1835,6 +1982,127 @@ class llama_zmq_server
             int output_dtype_tag
         )
         {
+            // Optimized combine path:
+            // - store float shards directly (no shard_bytes / Torch cat)
+            // - combine via memcpy into one output buffer when complete
+            auto [matrix_name, shard_num] = get_matrix_name_and_shard_number(filename);
+            if (shard_num < 0) {
+                shard_num = 0;
+            }
+
+            // Parse send_back encoding when available:
+            // - sign indicates System (System-2 uses negative)
+            // - abs encodes join_dim (tens) + shards (ones) when >= 10
+            int incoming_join_dim = 0;
+            int incoming_shards_needed = 0;
+            bool incoming_system2 = false;
+            const bool has_send_back = (total_shards != 0);
+            if (has_send_back) {
+                const int abs_val = std::abs(total_shards);
+                incoming_join_dim = 0;
+                incoming_shards_needed = abs_val;
+                if (abs_val >= 10) {
+                    incoming_join_dim = abs_val / 10;
+                    incoming_shards_needed = abs_val % 10;
+                }
+                incoming_system2 = (total_shards < 0);
+            }
+
+            bool completed = false;
+            combined_matrix_shards done;
+            int done_needed = 0;
+            int done_output_dtype_tag = -1;
+
+            {
+                std::lock_guard<std::mutex> lock(combined_matrix_shards_mutex);
+
+                auto [it, inserted] = combined_matrix_shards_map.try_emplace(matrix_name);
+                combined_matrix_shards& combined = it->second;
+                if (inserted || combined.file_name.empty()) {
+                    combined.file_name = matrix_name;
+                }
+
+                // Persist shard-count/system/join-dim when we first learn it.
+                if (combined.number_of_shards_needed == 0 && has_send_back) {
+                    combined.join_dim = incoming_join_dim;
+                    combined.number_of_shards_needed = incoming_shards_needed;
+                    combined.is_system2 = incoming_system2;
+                }
+
+                combined.output_dtype_tag =
+                    merge_output_dtype_tag(combined.output_dtype_tag, output_dtype_tag);
+
+                // Dedupe retransmits
+                if (combined.shards.find(shard_num) != combined.shards.end()) {
+                    return true;
+                }
+
+                combined_matrix_shards::ShardView view;
+                view.rows = shard_rows;
+                view.cols = shard_cols;
+                view.data = std::move(data);
+                combined.shards.emplace(shard_num, std::move(view));
+                combined.total_shards_reserved = static_cast<int>(combined.shards.size());
+
+                if (!combined.have_index_range) {
+                    combined.have_index_range = true;
+                    combined.min_shard_index = shard_num;
+                    combined.max_shard_index = shard_num;
+                } else {
+                    combined.min_shard_index = std::min(combined.min_shard_index, shard_num);
+                    combined.max_shard_index = std::max(combined.max_shard_index, shard_num);
+                }
+
+                done_needed = combined.number_of_shards_needed;
+                if (done_needed > 0 && combined.total_shards_reserved == done_needed) {
+                    completed = true;
+                    done_output_dtype_tag = combined.output_dtype_tag;
+                    done = std::move(combined);
+                    combined_matrix_shards_map.erase(it);
+                }
+            }
+
+            if (!completed) {
+                return true;
+            }
+
+            MatrixResult full;
+            if (done_needed == 1) {
+                if (done.shards.size() != 1) {
+                    std::cerr << "ERROR: Expected 1 shard but got "
+                              << done.shards.size() << " for " << matrix_name << std::endl;
+                    return true;
+                }
+                auto& only = done.shards.begin()->second;
+                full.dims[0] = 1;
+                full.dims[1] = 1;
+                full.dims[2] = only.rows;
+                full.dims[3] = only.cols;
+                full.data = std::move(only.data);
+            } else {
+                full = done.is_system2
+                    ? combine_matrix_shards_grid_2d(done)
+                    : combine_matrix_shards_2d(done);
+            }
+
+            if (full.data) {
+                const bool sent = send_combined_bin_to_python(
+                    matrix_name,
+                    full,
+                    done_output_dtype_tag
+                );
+                if (!sent) {
+                    std::cerr << "ERROR: Failed to stream combined PT for "
+                              << matrix_name << std::endl;
+                }
+                send_ack("ACK_combined_matrix_saved");
+            } else {
+                std::cerr << "ERROR: Combine failed for " << matrix_name << std::endl;
+            }
+
+            return true;
+
+#if 0
             // ============================================================
             // DEBUG: Print incoming parameters
             // ============================================================
@@ -2132,12 +2400,130 @@ class llama_zmq_server
                     << std::endl;
 
             return true;
+#endif
         }
 
-        MatrixResult combine_matrix_shards_2d(const combined_matrix_shards& combined)
+        MatrixResult combine_matrix_shards_2d(combined_matrix_shards& combined)
         {
             MatrixResult result;
 
+            if (combined.shards.empty()) {
+                return result;
+            }
+
+            const int expected = combined.number_of_shards_needed;
+            if (expected <= 0) {
+                throw std::runtime_error("combine_matrix_shards_2d called without known shard count");
+            }
+            if (static_cast<int>(combined.shards.size()) != expected) {
+                throw std::runtime_error("combine_matrix_shards_2d missing shards");
+            }
+
+            std::vector<int> order;
+            order.reserve((size_t)expected);
+            if (combined.have_index_range && (combined.max_shard_index - combined.min_shard_index + 1 == expected)) {
+                for (int i = combined.min_shard_index; i <= combined.max_shard_index; ++i) {
+                    order.push_back(i);
+                }
+            } else {
+                for (const auto& kv : combined.shards) {
+                    order.push_back(kv.first);
+                }
+                std::sort(order.begin(), order.end());
+            }
+
+            const int join_dim = combined.join_dim;
+            if (join_dim != 0 && join_dim != 1) {
+                throw std::runtime_error("combine_matrix_shards_2d only supports join_dim 0 or 1");
+            }
+
+            int total_rows = 0;
+            int total_cols = 0;
+            int fixed_rows = -1;
+            int fixed_cols = -1;
+
+            if (join_dim == 0) {
+                for (int idx : order) {
+                    const auto it = combined.shards.find(idx);
+                    if (it == combined.shards.end()) {
+                        throw std::runtime_error("Missing shard index during combine");
+                    }
+                    const auto& s = it->second;
+                    if (fixed_cols < 0) fixed_cols = s.cols;
+                    if (s.cols != fixed_cols) {
+                        throw std::runtime_error("Shard col mismatch for join_dim=0");
+                    }
+                    total_rows += s.rows;
+                }
+                total_cols = fixed_cols;
+            } else {
+                for (int idx : order) {
+                    const auto it = combined.shards.find(idx);
+                    if (it == combined.shards.end()) {
+                        throw std::runtime_error("Missing shard index during combine");
+                    }
+                    const auto& s = it->second;
+                    if (fixed_rows < 0) fixed_rows = s.rows;
+                    if (s.rows != fixed_rows) {
+                        throw std::runtime_error("Shard row mismatch for join_dim=1");
+                    }
+                    total_cols += s.cols;
+                }
+                total_rows = fixed_rows;
+            }
+
+            if (total_rows <= 0 || total_cols <= 0) {
+                throw std::runtime_error("Invalid combined shape");
+            }
+
+            result.dims[0] = 1;
+            result.dims[1] = 1;
+            result.dims[2] = total_rows;
+            result.dims[3] = total_cols;
+            const size_t total = static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols);
+            result.data = std::make_unique<float[]>(total);
+
+            if (join_dim == 0) {
+                int row_off = 0;
+                for (int idx : order) {
+                    auto it = combined.shards.find(idx);
+                    auto& s = it->second;
+                    const size_t shard_elems = static_cast<size_t>(s.rows) * static_cast<size_t>(s.cols);
+                    if (!s.data || shard_elems == 0) {
+                        throw std::runtime_error("Missing shard payload during combine");
+                    }
+                    std::memcpy(
+                        result.data.get() + static_cast<size_t>(row_off) * static_cast<size_t>(total_cols),
+                        s.data.get(),
+                        shard_elems * sizeof(float)
+                    );
+                    row_off += s.rows;
+                    s.data.reset();
+                }
+            } else {
+                int col_off = 0;
+                for (int idx : order) {
+                    auto it = combined.shards.find(idx);
+                    auto& s = it->second;
+                    if (!s.data) {
+                        throw std::runtime_error("Missing shard payload during combine");
+                    }
+                    for (int r = 0; r < total_rows; ++r) {
+                        float* dst = result.data.get()
+                            + static_cast<size_t>(r) * static_cast<size_t>(total_cols)
+                            + static_cast<size_t>(col_off);
+                        const float* src = s.data.get()
+                            + static_cast<size_t>(r) * static_cast<size_t>(s.cols);
+                        std::memcpy(dst, src, static_cast<size_t>(s.cols) * sizeof(float));
+                    }
+                    col_off += s.cols;
+                    s.data.reset();
+                }
+            }
+
+            return result;
+
+#if 0
             if (combined.received_matrix_data.empty()) {
                 return result;
             }
@@ -2268,14 +2654,130 @@ class llama_zmq_server
                     << result.dims[2] << " x " << result.dims[3] << ")\n";
 
             return result;
+#endif
         }
 
-        MatrixResult combine_matrix_shards_grid_2d(
-            const combined_matrix_shards& combined
-        )
+        MatrixResult combine_matrix_shards_grid_2d(combined_matrix_shards& combined)
         {
             MatrixResult result;
 
+            if (combined.shards.empty()) {
+                return result;
+            }
+
+            const int expected = combined.number_of_shards_needed;
+            if (expected <= 0) {
+                throw std::runtime_error("combine_matrix_shards_grid_2d called without known shard count");
+            }
+            if (static_cast<int>(combined.shards.size()) != expected) {
+                throw std::runtime_error("combine_matrix_shards_grid_2d missing shards");
+            }
+
+            // System-2 dispatch is a 2 x N grid.
+            constexpr int row_parts = 2;
+            if (expected % row_parts != 0) {
+                throw std::runtime_error("System-2 grid expects an even number of shards");
+            }
+            const int col_parts = expected / row_parts;
+
+            int min_i = 0;
+            int max_i = -1;
+            if (combined.have_index_range) {
+                min_i = combined.min_shard_index;
+                max_i = combined.max_shard_index;
+            } else {
+                min_i = std::numeric_limits<int>::max();
+                max_i = std::numeric_limits<int>::min();
+                for (const auto& kv : combined.shards) {
+                    min_i = std::min(min_i, kv.first);
+                    max_i = std::max(max_i, kv.first);
+                }
+            }
+
+            if (max_i - min_i + 1 != expected) {
+                throw std::runtime_error("System-2 combine expects contiguous shard indices; got gaps");
+            }
+
+            std::vector<combined_matrix_shards::ShardView*> grid((size_t)expected, nullptr);
+            for (int i = min_i; i <= max_i; ++i) {
+                auto it = combined.shards.find(i);
+                if (it == combined.shards.end()) {
+                    throw std::runtime_error("Missing System-2 shard index during combine");
+                }
+                grid[(size_t)(i - min_i)] = &it->second;
+            }
+
+            // Row heights (2 parts) and column widths (N parts) may be uneven due to remainder.
+            std::vector<int> row_heights((size_t)row_parts, 0);
+            std::vector<int> col_widths((size_t)col_parts, 0);
+
+            for (int r = 0; r < row_parts; ++r) {
+                auto* t0 = grid[(size_t)(r * col_parts)];
+                if (!t0) throw std::runtime_error("Missing System-2 shard block");
+                row_heights[(size_t)r] = t0->rows;
+                for (int c = 0; c < col_parts; ++c) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
+                    if (blk->rows != row_heights[(size_t)r]) {
+                        throw std::runtime_error("System-2 row-block height mismatch within same row");
+                    }
+                }
+            }
+
+            for (int c = 0; c < col_parts; ++c) {
+                auto* t0 = grid[(size_t)c];
+                if (!t0) throw std::runtime_error("Missing System-2 shard block");
+                col_widths[(size_t)c] = t0->cols;
+                for (int r = 0; r < row_parts; ++r) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
+                    if (blk->cols != col_widths[(size_t)c]) {
+                        throw std::runtime_error("System-2 col-block width mismatch within same column");
+                    }
+                }
+            }
+
+            int total_rows = 0;
+            for (int r = 0; r < row_parts; ++r) total_rows += row_heights[(size_t)r];
+            int total_cols = 0;
+            for (int c = 0; c < col_parts; ++c) total_cols += col_widths[(size_t)c];
+
+            if (total_rows <= 0 || total_cols <= 0) {
+                throw std::runtime_error("Invalid System-2 combined shape");
+            }
+
+            result.dims[0] = 1;
+            result.dims[1] = 1;
+            result.dims[2] = total_rows;
+            result.dims[3] = total_cols;
+            const size_t total = static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols);
+            result.data = std::make_unique<float[]>(total);
+
+            int row_off = 0;
+            for (int r = 0; r < row_parts; ++r) {
+                int col_off = 0;
+                for (int c = 0; c < col_parts; ++c) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    if (!blk || !blk->data) {
+                        throw std::runtime_error("Missing System-2 shard payload");
+                    }
+                    for (int rr = 0; rr < row_heights[(size_t)r]; ++rr) {
+                        float* dst = result.data.get()
+                            + static_cast<size_t>(row_off + rr) * static_cast<size_t>(total_cols)
+                            + static_cast<size_t>(col_off);
+                        const float* src = blk->data.get()
+                            + static_cast<size_t>(rr) * static_cast<size_t>(blk->cols);
+                        std::memcpy(dst, src, static_cast<size_t>(blk->cols) * sizeof(float));
+                    }
+                    col_off += col_widths[(size_t)c];
+                    blk->data.reset();
+                }
+                row_off += row_heights[(size_t)r];
+            }
+
+            return result;
+
+#if 0
             if (combined.received_matrix_data.empty()) {
                 return result;
             }
@@ -2449,6 +2951,7 @@ class llama_zmq_server
                     << result.dims[2] << " x " << result.dims[3] << ")\n";
 
             return result;
+#endif
         }
 
         bool matrix_operation(
