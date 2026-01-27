@@ -1,4 +1,4 @@
-NOTE: UPDATES IN PROGRESS!! *transformer code works but is not efficient or robust. It is just an exsample of how you could create a tranformer with cluster matrix -- efficient and robust full transformer coming soon* 
+NOTE: UPDATES IN PROGRESS!! *transformer code works but is not efficient or robust. It is just an example of how you could create a tranformer with cluster matrix -- efficient and robust full transformer coming soon* 
 ---
 # 🚀 **Open Cluster AI Station – Mamba / GQA Multi-Node Setup**
 
