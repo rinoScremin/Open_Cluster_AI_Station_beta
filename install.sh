@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+IFS=$'\n\t'
+trap 'echo "❌ Install failed at line $LINENO. See logs above." >&2' ERR
 
 # ================================
 # Main Install Script
@@ -10,20 +12,52 @@ echo "      Open Cluster AI Station Installer"
 echo "==========================================="
 echo
 
-# Prompt user for installation type
-echo "Select installation type:"
-echo "  1) Full install (Python environment + ggml backend)"
-echo "  2) Worker node only install (ggml backend only)"
-read -p "Enter choice [1 or 2]: " INSTALL_TYPE
+usage() {
+    cat <<'EOF'
+Usage: ./install.sh [--full|--worker] [--non-interactive]
 
-# Path to install scripts
-INSTALL_DIR="$(dirname "$0")/install"
+Options:
+  --full, -f            Full install (Python environment + ggml backend)
+  --worker, -w          Worker node only install (ggml backend only)
+  --non-interactive, -n Do not prompt; uses DEFAULT_INSTALL_TYPE if set (default: 1)
+  --help, -h            Show this help
+EOF
+}
 
-PROJECT_ROOT="$(pwd)"
+NON_INTERACTIVE=0
+INSTALL_TYPE=""
 
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full|-f) INSTALL_TYPE="1"; shift ;;
+        --worker|-w) INSTALL_TYPE="2"; shift ;;
+        --non-interactive|-n) NON_INTERACTIVE=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "❌ Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+# Resolve paths from script location
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$PROJECT_ROOT/install"
 PY_ENV_SCRIPT="$INSTALL_DIR/install_py_env.sh"
 GGML_BACKEND_SCRIPT="$INSTALL_DIR/build_ggml_backend.sh"
-LIBTORCH_SCRIPT="$INSTALL_DIR/install_libtorch.sh"
+
+cd "$PROJECT_ROOT"
+
+# Prompt user for installation type if needed
+if [[ -z "$INSTALL_TYPE" ]]; then
+    if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+        INSTALL_TYPE="${DEFAULT_INSTALL_TYPE:-1}"
+        echo "ℹ️ Non-interactive mode. Using install type: $INSTALL_TYPE"
+    else
+        echo "Select installation type:"
+        echo "  1) Full install (Python environment + ggml backend)"
+        echo "  2) Worker node only install (ggml backend only)"
+        read -r -p "Enter choice [1 or 2] (default: 1): " INSTALL_TYPE
+        INSTALL_TYPE="${INSTALL_TYPE:-1}"
+    fi
+fi
 
 # Validate scripts exist
 if [[ ! -f "$GGML_BACKEND_SCRIPT" ]]; then
