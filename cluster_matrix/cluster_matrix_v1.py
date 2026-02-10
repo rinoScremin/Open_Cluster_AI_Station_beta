@@ -626,6 +626,7 @@ class cluster_matrix:
         matrix_name='',
         matrix_labeling='',
         auto_set_up=None,
+        save_bin_matrix=True
     ):
         
         #print("=" * 70)
@@ -744,6 +745,7 @@ class cluster_matrix:
         self.OG_matrix_shape = []
         self.node_matrices_shapes_list = None
         self.matrix_labeling= matrix_labeling
+        self.save_bin_matrix = save_bin_matrix
 
         # Extract matrix name from file path
         if torch.is_tensor(matrix_file_path):
@@ -1043,7 +1045,8 @@ class cluster_matrix:
                 #print(f"  Head node: Saving to DISK={save_file_path_DISK}")
                 
                 # Save tensor to binary file on disk (no /dev/shm)
-                self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_DISK)
+                if self.save_bin_matrix:
+                    self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_DISK)
 
                 # Stream to local C++ server (head node) so it is available in memory.
                 self.cluster_zmq_object.stream_matrix_binary(self.IP, self.node_matrices[shard_index], stream_name)
@@ -1093,7 +1096,8 @@ class cluster_matrix:
         
         # Save to binary format locally
         #print("Saving to local storage...")
-        self.save_matrix_binary(full_matrix, save_file_path_DISK)
+        if self.save_bin_matrix:
+            self.save_matrix_binary(full_matrix, save_file_path_DISK)
 
         # Track matrix name for each slot (no /dev/shm paths)
         self.matrix_file_paths_list = [save_name for _ in self.node_IP_list]
