@@ -1,0 +1,23 @@
+{
+  "name": "desktop_laptop",
+  "nodes": [
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.5,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.45,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.101",
+      "percentage": 0.05,
+      "device": "GPU",
+      "backend": "llama"
+    }
+  ]
+}

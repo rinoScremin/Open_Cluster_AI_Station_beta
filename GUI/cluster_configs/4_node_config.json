@@ -1,0 +1,29 @@
+{
+  "name": "4_node_config",
+  "nodes": [
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.45,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.4,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.101",
+      "percentage": 0.05,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.104",
+      "percentage": 0.05,
+      "device": "GPU",
+      "backend": "torch"
+    }
+  ]
+}

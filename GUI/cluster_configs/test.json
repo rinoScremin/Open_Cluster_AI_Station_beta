@@ -1,0 +1,23 @@
+{
+  "name": "test",
+  "nodes": [
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.1,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.100",
+      "percentage": 0.1,
+      "device": "GPU",
+      "backend": "llama"
+    },
+    {
+      "ip": "192.168.2.101",
+      "percentage": 0.1,
+      "device": "GPU",
+      "backend": "llama"
+    }
+  ]
+}
