@@ -798,7 +798,8 @@ class llama_cluster_transformer:
                 split_matrix=False,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='x_norm'
+                matrix_name='x_norm',
+                save_bin_matrix=False
             )
 
             _, Q_weight, _, _ = self.model.q_proj_list[layer_index]
@@ -857,7 +858,8 @@ class llama_cluster_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='Q_cluster'
+                matrix_name='Q_cluster',
+                save_bin_matrix=False
             )
 
             K = cluster_matrix(
@@ -869,7 +871,8 @@ class llama_cluster_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='K_cluster'
+                matrix_name='K_cluster',
+                save_bin_matrix=False
             )
 
             V = cluster_matrix(
@@ -881,7 +884,8 @@ class llama_cluster_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='V_cluster'
+                matrix_name='V_cluster',
+                save_bin_matrix=False
             )
 
             mask = self._build_causal_mask(
@@ -926,7 +930,8 @@ class llama_cluster_transformer:
                 split_matrix=False,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='attn_out_cluster'
+                matrix_name='attn_out_cluster',
+                save_bin_matrix=False
             )
 
             attn_out_cluster = attn_out_cluster.cluster_shard_operation(O_weight, False, False, True)
@@ -949,7 +954,8 @@ class llama_cluster_transformer:
                 split_matrix=False,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='X_cluster'
+                matrix_name='X_cluster',
+                save_bin_matrix=False
             )
 
             # ---- MLP ----
@@ -967,7 +973,8 @@ class llama_cluster_transformer:
                 split_matrix=False,
                 dim=1,
                 auto_set_up=[1, "save"],
-                matrix_name='hidden_glu_cluster'
+                matrix_name='hidden_glu_cluster',
+                save_bin_matrix=False
             )
 
             hidden_down_cluster = hidden_glu_cluster.cluster_shard_operation(hidden_down_weight, False, False, True)
