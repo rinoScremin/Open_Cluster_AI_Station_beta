@@ -32,6 +32,7 @@ pip install \
   psutil \
   tqdm
 
+pip install nicegui
 echo "🔥 Installing PyTorch"
 # ---- CPU ONLY ----
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu

@@ -32,10 +32,63 @@ struct MatrixResult
     int dims[4]; // ne0, ne1, ne2, ne3  
 };  
 
+struct combined_matrix_shards
+{
+    struct ShardView {
+        int batch = 1;
+        int depth = 1;
+        int rows = 0;
+        int cols = 0;
+        int dtype_tag = -1; // -1 f32, -2 fp16, -3 bf16
+        std::unique_ptr<float[]> data;
+    };
+
+    int total_shards_reserved = 0;   // Number of unique shards currently received
+    int number_of_shards_needed = 0; // Total shards expected for this matrix (0 until learned)
+    std::string file_name;           // Base filename (without shard index)
+
+    // Shards keyed by shard index (float32 payload).
+    std::unordered_map<int, ShardView> shards;
+
+    // Track index range to avoid sorting in combine when indices are contiguous.
+    int min_shard_index = 0;
+    int max_shard_index = -1;
+    bool have_index_range = false;
+
+    // System marker:
+    // - System 1: concatenate shards along join_dim
+    // - System 2: 2D grid tile assembly
+    bool is_system2 = false;
+
+    // Output dtype tag for the final combined matrix (v2 header):
+    //   -1 = float32, -2 = float16, -3 = bfloat16
+    int output_dtype_tag = -1;
+
+    int join_dim = 0; // 0 = rows, 1 = cols (for 2D outputs)
+};
+
+struct matrix_shard_object
+{
+    std::string base_file_name;
+    int rows_A = 0;
+    int cols_A = 0;
+    int batchA = 1;
+    int depthA = 1;
+    std::shared_ptr<std::vector<float>> data;
+    int output_dtype_tag = -1; // -1 float32, -2 float16, -3 bfloat16
+};
+
 static inline uint16_t float_to_bf16_bits(float f) {
     uint32_t bits;
     std::memcpy(&bits, &f, sizeof(bits));
     return (uint16_t)(bits >> 16);
+}
+
+static inline float bf16_bits_to_float(uint16_t v) {
+    uint32_t bits = uint32_t(v) << 16;
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
 }
 
 static inline uint16_t float_to_fp16_bits(float f) {
@@ -82,6 +135,93 @@ static inline uint16_t float_to_fp16_bits(float f) {
 
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant16 & 0x03FFu));
 }
+
+//NEW CODE 
+// ===================== SOFTMAX EXT =====================
+struct SoftMaxExtParams {
+    float* mask_data;          // optional (nullptr allowed)
+    int mask_dims[4];          // only used if mask_data != nullptr
+    float scale;
+    float max_bias;
+};
+
+// ===================== FLASH ATTENTION =====================
+struct FlashAttnParams {
+    float* q_data;
+    float* k_data;
+    float* v_data;
+    float* mask_data;          // optional
+
+    // Dimensions are GGML tensor dims (ne0, ne1, ne2, ne3).
+    int q_dims[4];
+    int k_dims[4];
+    int v_dims[4];
+    int mask_dims[4];          // ignored if mask_data == nullptr
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+};
+
+// FlashAttention using pre-existing GGML tensors (e.g. cached in VRAM).
+// All tensors must already be allocated/initialized on the target backend.
+struct FlashAttnTensorParams {
+    struct ggml_tensor* v;          // required
+    struct ggml_tensor* mask;       // optional (nullptr allowed)
+    float scale;
+    float max_bias;
+    float logit_softcap;
+};
+
+// ===================== ROPE (BASE) =====================
+struct RoPEParams {
+    int32_t* pos_data;
+    int pos_dims[4];
+    int n_dims;
+    int mode;
+};
+
+// ===================== ROPE EXT =====================
+struct RoPEExtParams {
+    int32_t* pos_data;
+    float* freq_factors_data;
+
+    int pos_dims[4];
+    int freq_dims[4];
+
+    int n_dims;
+    int mode;
+    int n_ctx_orig;
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
+// ===================== ROPE MULTI =====================
+struct RoPEMultiParams {
+    int32_t* pos_data;
+    float* freq_factors_data;
+
+    int pos_dims[4];
+    int freq_dims[4];
+
+    int n_dims;
+    int sections[4];
+    int mode;
+    int n_ctx_orig;
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+//END NEW CODE
 
 // ============================================================================
 // OPENCL KERNELS FOR MATRIX MULTIPLICATION
@@ -979,218 +1119,637 @@ class llama_matrix_backend
             return ggml_backends.empty() ? (ggml_backend_t)nullptr : ggml_backends[best];
         }
 
-        MatrixResult matrix_op_nd(  
-            float* matrix_a, const int dims_a[4],  
-            float* matrix_b, const int dims_b[4],  
-            ggml_backend_t backend,  
-            const std::string& op = "mul")  
-        {  
-            stat_ops.fetch_add(1, std::memory_order_relaxed);
-                // Validate dimensions - NO ZERO DIMENSIONS ALLOWED  
-            for (int i = 0; i < 4; i++) {  
-                if (dims_a[i] == 0 || dims_b[i] == 0) {  
-                    std::cerr << "Error: Zero dimension detected at index " << i << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-            }  
-                
-                // Initialize GGML context (use persistent per-device context when available)
-            int backend_index = -1;
-            if (!backend) {
-                backend = pick_least_loaded_backend();
-            }
-            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {
-                if (ggml_backends[bi] == backend) { backend_index = (int)bi; break; }
+        ggml_context* get_thread_graph_ctx(size_t wanted_bytes, bool bump_for_flash_attn) {
+            struct ThreadCtxState {
+                ggml_context* ctx = nullptr;
+                void* mem = nullptr;
+                size_t mem_size = 0;
+                ~ThreadCtxState() {
+                    if (ctx) ggml_free(ctx);
+                    if (mem) free(mem);
+                }
+            };
+            static thread_local ThreadCtxState st;
+
+            size_t bytes = wanted_bytes;
+            if (bytes == 0) {
+                size_t mb = 64;
+                const char* env_mb = std::getenv("GGML_GRAPH_CTX_MEM_MB");
+                if (env_mb) {
+                    try { mb = std::stoul(env_mb); } catch (...) {}
+                }
+                bytes = mb * 1024ULL * 1024ULL;
             }
 
-            struct ggml_context* ctx = nullptr;
-            bool ctx_is_persistent = false;
-            if (backend_index >= 0 && backend_index < (int)ggml_ctxs.size() && ggml_ctxs[backend_index]) {
-                ctx = ggml_ctxs[backend_index];
-                ctx_is_persistent = true;
+            size_t min_mb = 16;
+            const char* env_min = std::getenv("GGML_GRAPH_CTX_MIN_MB");
+            if (env_min) {
+                try { min_mb = std::stoul(env_min); } catch (...) {}
+            }
+            size_t max_mb = 1024; // 1GB safety cap
+            const char* env_max = std::getenv("GGML_GRAPH_CTX_MAX_MB");
+            if (env_max) {
+                try { max_mb = std::stoul(env_max); } catch (...) {}
+            }
+            if (max_mb < min_mb) max_mb = min_mb;
+
+            if (bump_for_flash_attn) {
+                // flash_attn_ext graphs can be node-heavy; keep a larger default to avoid ctx OOM.
+                const size_t min_bytes = 128ULL * 1024ULL * 1024ULL;
+                bytes = std::max(bytes, min_bytes);
+            }
+
+            size_t min_bytes = min_mb * 1024ULL * 1024ULL;
+            size_t max_bytes = max_mb * 1024ULL * 1024ULL;
+            if (bytes < min_bytes) bytes = min_bytes;
+            if (bytes > max_bytes) {
+                std::cerr << "Warning: Requested GGML graph ctx " << bytes
+                          << " exceeds max " << max_bytes
+                          << " (cap applied). Consider GGML_GRAPH_CTX_MAX_MB."
+                          << std::endl;
+                bytes = max_bytes;
+            }
+
+            if (!st.ctx || !st.mem || bytes > st.mem_size) {
+                // Try to allocate new buffer without discarding the old one first.
+                size_t attempt = bytes;
+                void* new_mem = malloc(attempt);
+                while (!new_mem && attempt > min_bytes) {
+                    attempt = std::max(min_bytes, attempt / 2);
+                    new_mem = malloc(attempt);
+                }
+
+                if (!new_mem) {
+                    // Fall back to existing context if available.
+                    if (st.ctx && st.mem) {
+                        std::cerr << "Warning: GGML graph ctx alloc failed for "
+                                  << bytes << " bytes; reusing existing "
+                                  << st.mem_size << " bytes." << std::endl;
+                        ggml_reset(st.ctx);
+                        return st.ctx;
+                    }
+                    st.ctx = nullptr;
+                    return nullptr;
+                }
+
+                // Replace old context with new allocation.
+                if (st.ctx) ggml_free(st.ctx);
+                if (st.mem) free(st.mem);
+                st.mem = new_mem;
+                st.mem_size = attempt;
+
+                ggml_init_params params;
+                params.mem_size = st.mem_size;
+                params.mem_buffer = st.mem;
+                params.no_alloc = true;
+                st.ctx = ggml_init(params);
+                if (!st.ctx) {
+                    free(st.mem);
+                    st.mem = nullptr;
+                    st.mem_size = 0;
+                    return nullptr;
+                }
             } else {
-                struct ggml_init_params params;
-                params.mem_size = 16 * 1024 * 1024;
-                params.mem_buffer = NULL;
-                // temporary contexts must allow allocations for tensor/back-end work
-                params.no_alloc = false;
-                ctx = ggml_init(params);
+                ggml_reset(st.ctx);
             }
 
-            // RAII: only free ctx if it was a temporary allocation
-            auto ctx_deleter = [&](struct ggml_context* p) { if (p && !ctx_is_persistent) ggml_free(p); };
-            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);
-                
-                // Validate dimensions for matrix multiplication  
-                if (op == "mul") {  
-                if (dims_a[0] != dims_b[0]) {  
-                    std::cerr << "Error: For matrix multiplication, dims_a[0] must equal dims_b[0]" << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-                if ((dims_b[2] % dims_a[2] != 0) || (dims_b[3] % dims_a[3] != 0)) {  
-                    std::cerr << "Error: Broadcasting rules violated" << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-            }  
-                
-                // Create tensors (data pointers are NULL at this point)  
-            struct ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims_a[0], dims_a[1], dims_a[2], dims_a[3]);  
-            struct ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims_b[0], dims_b[1], dims_b[2], dims_b[3]);  
-                
-                // Build computation graph  
-            struct ggml_tensor* result;  
-            if (op == "mul") {  
-                result = ggml_mul_mat(ctx, a, b);  
-            } else if (op == "add") {  
-                result = ggml_add(ctx, a, b);  
-            } else if (op == "sub") {  
-                result = ggml_sub(ctx, a, b);  
-            } else {  
-                return {nullptr, {0,0,0,0}};  
-            }  
-                
-                // Create and build computation graph  
-            struct ggml_cgraph* gf = ggml_new_graph(ctx);  
-            ggml_build_forward_expand(gf, result);  
-                
-                // Allocate tensors on backend FIRST  
-            // Use per-device mutex to serialize allocations/compute per device if available
-            std::unique_lock<std::mutex> device_lock;
-            bool incremented_load = false;
-            if (backend_index >= 0 && backend_index < (int)device_mutexes.size()) {
-                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);
-                // increment load counter
-                if (backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);
-                    incremented_load = true;
-                }
-            }
-
-            // Allocate backend buffers for this graph. If allocation fails, return early.
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
-            if (!buf) {  
-                if (incremented_load && backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
-                }
-                return {nullptr, {0,0,0,0}};  
-            }  
-                
-                // Calculate total elements for data transfer  
-            int64_t total_a = dims_a[0] * dims_a[1] * dims_a[2] * dims_a[3];  
-            int64_t total_b = dims_b[0] * dims_b[1] * dims_b[2] * dims_b[3];  
-                
-                // NOW copy data to tensors using backend functions  
-            ggml_backend_tensor_set(a, matrix_a, 0, sizeof(float) * total_a);  
-            ggml_backend_tensor_set(b, matrix_b, 0, sizeof(float) * total_b);  
-                
-                // Execute computation  
-            ggml_backend_graph_compute(backend, gf);  
-                
-                // Extract result data using backend function  
-            MatrixResult output;  
-            int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
-            output.data = std::make_unique<float[]>(total_result);  
-
-            
-            // CORRECT - Keep dimensions as-is  
-            output.dims[0] = result->ne[3]; // batch  
-            output.dims[1] = result->ne[2]; // depth    
-            output.dims[2] = result->ne[1]; // rows  
-            output.dims[3] = result->ne[0]; // cols
-
-                
-            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);  
-            // so i can just change this to get the correct formaty>
-            //make it so the tensor matchs the torch format after the mul so c1=c2
-
-            // Cleanup
-            ggml_backend_buffer_free(buf);
-            if (incremented_load && backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
-            }
-            if (device_lock.owns_lock()) device_lock.unlock();
-
-            stat_allocs.fetch_add(1, std::memory_order_relaxed);
-
-            return output;  
+            return st.ctx;
         }
 
-        // Variant: operate using pre-existing GGML tensors (e.g. cached in VRAM).
-        // The input tensors must already be initialized on the target backend.
-        MatrixResult matrix_op_nd_tensors(
-            struct ggml_tensor* a,
-            struct ggml_tensor* b,
+        MatrixResult matrix_op_nd(
+            float* matrix_a, const int dims_a[4],
+            float* matrix_b, const int dims_b[4],
             ggml_backend_t backend,
-            const std::string& op = "mul")
+            const std::string& op = "mul",
+            void* extra_params = nullptr)
         {
             stat_ops.fetch_add(1, std::memory_order_relaxed);
 
-            if (!a || !b) {
-                std::cerr << "Error: matrix_op_nd_tensors got null input tensor(s)" << std::endl;
-                return {nullptr, {0, 0, 0, 0}};
+            const auto fail = [&]() -> MatrixResult {
+                return { nullptr, {0, 0, 0, 0} };
+            };
+
+            if (!matrix_a) {
+                std::cerr << "Error: matrix_op_nd got null matrix_a" << std::endl;
+                return fail();
             }
 
-            int backend_index = -1;
+            const bool unary =
+                (op == "gelu" || op == "silu" || op == "soft_max" ||
+                op == "gelu_quick" || op == "gelu_erf" || op == "rms_norm" ||
+                op == "rope" || op == "rope_ext" || op == "rope_multi");
+
+            for (int i = 0; i < 4; i++) {
+                if (dims_a[i] == 0) {
+                    std::cerr << "Error: Zero dimension in dims_a[" << i << "]" << std::endl;
+                    return fail();
+                }
+            }
+
+            if (!unary) {
+                if (!matrix_b) {
+                    std::cerr << "Error: matrix_b required for op " << op << std::endl;
+                    return fail();
+                }
+                for (int i = 0; i < 4; i++) {
+                    if (dims_b[i] == 0) {
+                        std::cerr << "Error: Zero dimension in dims_b[" << i << "]" << std::endl;
+                        return fail();
+                    }
+                }
+            }
+
             if (!backend) {
                 backend = pick_least_loaded_backend();
             }
+
+            int backend_index = -1;
             for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {
                 if (ggml_backends[bi] == backend) {
-                    backend_index = (int) bi;
+                    backend_index = (int)bi;
                     break;
                 }
             }
 
-            ggml_init_params params;
-            params.mem_size = 16 * 1024 * 1024;
-            params.mem_buffer = NULL;
-            params.no_alloc = false;
-            struct ggml_context* ctx = ggml_init(params);
+            ggml_context* ctx = get_thread_graph_ctx(
+                0,
+                /*bump_for_flash_attn=*/(op == "flash_attn_ext")
+            );
             if (!ctx) {
-                std::cerr << "Error: ggml_init failed in matrix_op_nd_tensors" << std::endl;
-                return {nullptr, {0, 0, 0, 0}};
+                std::cerr << "Error: get_thread_graph_ctx failed" << std::endl;
+                return fail();
             }
 
-            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };
-            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);
+            ggml_tensor* a =
+                ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    dims_a[0], dims_a[1], dims_a[2], dims_a[3]);
 
-            struct ggml_tensor* result = nullptr;
+            if (!a) return fail();
+
+            ggml_tensor* b = nullptr;
+            if (!unary) {
+                b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    dims_b[0], dims_b[1], dims_b[2], dims_b[3]);
+                if (!b) return fail();
+            }
+
+            ggml_tensor* result = nullptr;
+            ggml_tensor* v = nullptr;
+            ggml_tensor* mask = nullptr;
+
+            // ===================== STANDARD OPS =====================
             if (op == "mul") {
                 result = ggml_mul_mat(ctx, a, b);
             } else if (op == "add") {
                 result = ggml_add(ctx, a, b);
             } else if (op == "sub") {
                 result = ggml_sub(ctx, a, b);
-            } else {
-                std::cerr << "Error: Unsupported op in matrix_op_nd_tensors: " << op << std::endl;
-                return {nullptr, {0, 0, 0, 0}};
+            } else if (op == "gelu") {
+                result = ggml_gelu(ctx, a);
+            } else if (op == "gelu_quick") {
+                result = ggml_gelu_quick(ctx, a);
+            } else if (op == "gelu_erf") {
+                result = ggml_gelu_erf(ctx, a);
+            } else if (op == "silu") {
+                result = ggml_silu(ctx, a);
+            } else if (op == "soft_max") {
+                result = ggml_soft_max(ctx, a);
+            } else if (op == "rms_norm") {
+                result = ggml_rms_norm(ctx, a, 1e-6f);
             }
 
-            struct ggml_cgraph* gf = ggml_new_graph(ctx);
+            // ===================== FLASH ATTN =====================
+            else if (op == "flash_attn_ext") {
+                const FlashAttnParams* flash =
+                    reinterpret_cast<const FlashAttnParams*>(extra_params);
+
+                if (!flash || !flash->v_data) {
+                    std::cerr << "Error: flash_attn_ext missing params" << std::endl;
+                    return fail();
+                }
+                if (!(dims_b[0] == dims_a[0] &&
+                      dims_a[2] % dims_b[2] == 0 &&
+                      dims_a[3] % dims_b[3] == 0)) {
+                    std::cerr << "Error: flash_attn_ext incompatible Q/K shapes "
+                              << "(K=[" << dims_b[0] << "," << dims_b[1] << "," << dims_b[2] << "," << dims_b[3]
+                              << "], Q=[" << dims_a[0] << "," << dims_a[1] << "," << dims_a[2] << "," << dims_a[3] << "])"
+                              << std::endl;
+                    return fail();
+                }
+
+                v =
+                    ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                        flash->v_dims[0], flash->v_dims[1],
+                        flash->v_dims[2], flash->v_dims[3]);
+                if (!v) return fail();
+
+                if (flash->mask_data) {
+                    for (int i = 0; i < 4; ++i) {
+                        if (flash->mask_dims[i] <= 0) {
+                            std::cerr << "Error: flash_attn_ext invalid mask_dims[" << i << "]=" << flash->mask_dims[i] << std::endl;
+                            return fail();
+                        }
+                    }
+                    mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+                        flash->mask_dims[0], flash->mask_dims[1],
+                        flash->mask_dims[2], flash->mask_dims[3]);
+                    if (!mask) return fail();
+                }
+
+                result = ggml_flash_attn_ext(
+                    ctx, a, b, v, mask,
+                    flash->scale,
+                    flash->max_bias,
+                    flash->logit_softcap
+                );
+            }
+
+            // ===================== ROPE BASE =====================
+            else if (op == "rope") {  
+                const RoPEParams* rp = reinterpret_cast<const RoPEParams*>(extra_params);  
+            
+                if (!rp || !rp->pos_data) {  
+                    std::cerr << "Error: rope requires RoPEParams" << std::endl;  
+                    return fail();  
+                }  
+            
+                // Create position tensor with exactly sequence length elements  
+                ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, dims_a[2]);  
+            
+                result = ggml_rope(ctx, a, pos, rp->n_dims, rp->mode);  
+            }
+
+            // ===================== ROPE EXT =====================
+            else if (op == "rope_ext") {  
+                const RoPEExtParams* rp = reinterpret_cast<const RoPEExtParams*>(extra_params);  
+            
+                if (!rp || !rp->pos_data) {  
+                    std::cerr << "Error: rope_ext requires RoPEExtParams" << std::endl;  
+                    return fail();  
+                }  
+            
+                // Position tensor must match sequence length of input tensor  
+                ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, dims_a[2]);  
+            
+                // Frequency tensor can use params dimensions (for frequency factors)  
+                ggml_tensor* freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rp->freq_dims[0]);  
+            
+                result = ggml_rope_ext(  
+                    ctx,  
+                    a,  
+                    pos,  
+                    freq,  
+                    rp->n_dims,  
+                    rp->mode,  
+                    rp->n_ctx_orig,  
+                    rp->freq_base,  
+                    rp->freq_scale,  
+                    rp->ext_factor,  
+                    rp->attn_factor,  
+                    rp->beta_fast,  
+                    rp->beta_slow  
+                );  
+            }
+
+            // ===================== ROPE MULTI =====================
+            else if (op == "rope_multi") {  
+                const RoPEMultiParams* rp = reinterpret_cast<const RoPEMultiParams*>(extra_params);  
+            
+                if (!rp || !rp->pos_data) {  
+                    std::cerr << "Error: rope_multi requires RoPEMultiParams" << std::endl;  
+                    return fail();  
+                }  
+            
+                // Position tensor must match sequence length of input tensor  
+                // For MROPE mode, this might need to be dims_a[2] * 4  
+                ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, dims_a[2]);  
+            
+                ggml_tensor* freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rp->freq_dims[0]);  
+            
+                // Create a local non-const copy of sections  
+                int sections_local[4];  
+                for (int i = 0; i < 4; ++i) sections_local[i] = rp->sections[i];  
+            
+                result = ggml_rope_multi(  
+                    ctx,  
+                    a,  
+                    pos,  
+                    freq,  
+                    rp->n_dims,  
+                    sections_local,  // pass non-const copy  
+                    rp->mode,  
+                    rp->n_ctx_orig,  
+                    rp->freq_base,  
+                    rp->freq_scale,  
+                    rp->ext_factor,  
+                    rp->attn_factor,  
+                    rp->beta_fast,  
+                    rp->beta_slow  
+                );  
+            }
+
+            else {
+                std::cerr << "Error: Unknown op " << op << std::endl;
+                return fail();
+            }
+
+            if (!result) {
+                std::cerr << "Error: GGML returned null tensor" << std::endl;
+                return fail();
+            }
+
+            if (backend && !ggml_backend_supports_op(backend, result)) {
+                std::cerr << "Error: backend does not support op '" << op << "' for these tensor shapes" << std::endl;
+                return fail();
+            }
+
+            ggml_cgraph* gf = ggml_new_graph(ctx);
+            if (!gf) {
+                std::cerr << "Error: ggml_new_graph returned null" << std::endl;
+                return fail();
+            }
             ggml_build_forward_expand(gf, result);
 
             std::unique_lock<std::mutex> device_lock;
             bool incremented_load = false;
-            if (backend_index >= 0 && backend_index < (int) device_mutexes.size()) {
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {
                 device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);
-                if (backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
                     device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);
                     incremented_load = true;
                 }
             }
 
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-            if (!buf) {
-                if (incremented_load && backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
+            struct LoadGuard {
+                std::unique_lock<std::mutex>& lock;
+                std::vector<std::unique_ptr<std::atomic<uint64_t>>>& loads;
+                int idx;
+                bool dec;
+                ~LoadGuard() {
+                    if (dec && idx >= 0 && idx < (int)loads.size() && loads[idx]) {
+                        loads[idx]->fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    if (lock.owns_lock()) lock.unlock();
                 }
-                return {nullptr, {0, 0, 0, 0}};
+            } load_guard{device_lock, device_load_ptrs, backend_index, incremented_load};
+
+            ggml_backend_buffer_t buf =
+                ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) {
+                std::cerr << "Error: ggml_backend_alloc_ctx_tensors failed" << std::endl;
+                return fail();
+            }
+
+            ggml_backend_tensor_set(a, matrix_a, 0, ggml_nbytes(a));
+            if (!unary && b) {
+                ggml_backend_tensor_set(b, matrix_b, 0, ggml_nbytes(b));
+            }
+            if (op == "flash_attn_ext") {
+                const FlashAttnParams* flash =
+                    reinterpret_cast<const FlashAttnParams*>(extra_params);
+                if (!flash || !flash->v_data || !v) {
+                    ggml_backend_buffer_free(buf);
+                    std::cerr << "Error: flash_attn_ext missing V tensor/data" << std::endl;
+                    return fail();
+                }
+                ggml_backend_tensor_set(v, flash->v_data, 0, ggml_nbytes(v));
+                if (mask && flash->mask_data) {
+                    if (mask->type == GGML_TYPE_F16) {
+                        const int64_t elems = ggml_nelements(mask);
+                        std::vector<ggml_fp16_t> tmp((size_t)elems);
+                        ggml_fp32_to_fp16_row(flash->mask_data, tmp.data(), elems);
+                        ggml_backend_tensor_set(mask, tmp.data(), 0, ggml_nbytes(mask));
+                    } else {
+                        ggml_backend_tensor_set(mask, flash->mask_data, 0, ggml_nbytes(mask));
+                    }
+                }
             }
 
             ggml_backend_graph_compute(backend, gf);
 
+            MatrixResult out;
+            int64_t total =
+                result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];
+
+            out.data = std::make_unique<float[]>(total);
+            out.dims[0] = result->ne[3];
+            out.dims[1] = result->ne[2];
+            out.dims[2] = result->ne[1];
+            out.dims[3] = result->ne[0];
+
+            ggml_backend_tensor_get(
+                result, out.data.get(), 0, total * sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);
+            return out;
+        }
+
+        MatrixResult matrix_op_nd_tensors(
+            struct ggml_tensor* a,
+            struct ggml_tensor* b,
+            ggml_backend_t backend,
+            const std::string& op = "mul",
+            void* extra_params = nullptr)
+        {
+            stat_ops.fetch_add(1, std::memory_order_relaxed);
+
+            auto fail = []() -> MatrixResult {
+                return {nullptr, {0, 0, 0, 0}};
+            };
+
+            if (!a || (!b && op != "gelu" && op != "silu" && op != "rms_norm" && op != "soft_max")) {
+                std::cerr << "Error: matrix_op_nd_tensors got null input tensor(s)" << std::endl;
+                return fail();
+            }
+
+            int backend_index = -1;
+            if (!backend) backend = pick_least_loaded_backend();
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {
+                if (ggml_backends[bi] == backend) {
+                    backend_index = (int)bi;
+                    break;
+                }
+            }
+
+            struct ggml_context* ctx = get_thread_graph_ctx(
+                0,
+                /*bump_for_flash_attn=*/(op == "flash_attn_ext")
+            );
+            if (!ctx) {
+                std::cerr << "Error: get_thread_graph_ctx failed in matrix_op_nd_tensors" << std::endl;
+                return fail();
+            }
+
+            struct ggml_tensor* result = nullptr;
+
+            // === Core Ops ===
+            if (op == "mul") {
+                result = ggml_mul_mat(ctx, a, b);
+            } else if (op == "add") {
+                result = ggml_add(ctx, a, b);
+            } else if (op == "sub") {
+                result = ggml_sub(ctx, a, b);
+            } else if (op == "flash_attn_ext") {
+                const auto* p = reinterpret_cast<const FlashAttnTensorParams*>(extra_params);
+                if (!p || !p->v) {
+                    std::cerr << "Error: flash_attn_ext requires FlashAttnTensorParams{v,...}" << std::endl;
+                    return fail();
+                }
+                if (p->mask) {
+                    for (int i = 0; i < 4; ++i) {
+                        if (p->mask->ne[i] <= 0) {
+                            std::cerr << "Error: flash_attn_ext invalid mask tensor dims" << std::endl;
+                            return fail();
+                        }
+                    }
+                }
+                if (!(b->ne[0] == a->ne[0] &&
+                      a->ne[2] % b->ne[2] == 0 &&
+                      a->ne[3] % b->ne[3] == 0)) {
+                    std::cerr << "Error: flash_attn_ext incompatible Q/K shapes "
+                              << "(K=[" << b->ne[0] << "," << b->ne[1] << "," << b->ne[2] << "," << b->ne[3]
+                              << "], Q=[" << a->ne[0] << "," << a->ne[1] << "," << a->ne[2] << "," << a->ne[3] << "])"
+                              << std::endl;
+                    return fail();
+                }
+                result = ggml_flash_attn_ext(ctx, a, b, p->v, p->mask, p->scale, p->max_bias, p->logit_softcap);
+            } 
+            // === RoPE variants ===
+            else if (op == "rope") {
+                const RoPEParams* rp = reinterpret_cast<const RoPEParams*>(extra_params);
+                if (!rp || !rp->pos_data) {
+                    std::cerr << "Error: rope requires RoPEParams*" << std::endl;
+                    return fail();
+                }
+
+                ggml_tensor* pos = ggml_new_tensor_4d(
+                    ctx, GGML_TYPE_I32,
+                    rp->pos_dims[0], rp->pos_dims[1], rp->pos_dims[2], rp->pos_dims[3]);
+
+                ggml_backend_tensor_set(pos, rp->pos_data, 0, ggml_nbytes(pos));
+                result = ggml_rope(ctx, a, pos, rp->n_dims, rp->mode);
+            } else if (op == "rope_ext") {
+                const RoPEExtParams* rp = reinterpret_cast<const RoPEExtParams*>(extra_params);
+                if (!rp || !rp->pos_data) {
+                    std::cerr << "Error: rope_ext requires RoPEExtParams*" << std::endl;
+                    return fail();
+                }
+
+                ggml_tensor* pos = ggml_new_tensor_4d(
+                    ctx, GGML_TYPE_I32,
+                    rp->pos_dims[0], rp->pos_dims[1], rp->pos_dims[2], rp->pos_dims[3]);
+
+                ggml_tensor* freq_factors = nullptr;
+                if (rp->freq_factors_data) {
+                    freq_factors = ggml_new_tensor_4d(
+                        ctx, GGML_TYPE_F32,
+                        rp->freq_dims[0], rp->freq_dims[1], rp->freq_dims[2], rp->freq_dims[3]);
+                    ggml_backend_tensor_set(freq_factors, rp->freq_factors_data, 0, ggml_nbytes(freq_factors));
+                }
+
+                ggml_backend_tensor_set(pos, rp->pos_data, 0, ggml_nbytes(pos));
+
+                result = ggml_rope_ext(
+                    ctx, a, pos, freq_factors,
+                    rp->n_dims, rp->mode,
+                    rp->n_ctx_orig, rp->freq_base, rp->freq_scale,
+                    rp->ext_factor, rp->attn_factor, rp->beta_fast, rp->beta_slow);
+            } else if (op == "rope_multi") {
+                const RoPEMultiParams* rp = reinterpret_cast<const RoPEMultiParams*>(extra_params);
+                if (!rp || !rp->pos_data) {
+                    std::cerr << "Error: rope_multi requires RoPEMultiParams*" << std::endl;
+                    return fail();
+                }
+
+                ggml_tensor* pos = ggml_new_tensor_4d(
+                    ctx, GGML_TYPE_I32,
+                    rp->pos_dims[0], rp->pos_dims[1], rp->pos_dims[2], rp->pos_dims[3]);
+
+                ggml_tensor* freq_factors = nullptr;
+                if (rp->freq_factors_data) {
+                    freq_factors = ggml_new_tensor_4d(
+                        ctx, GGML_TYPE_F32,
+                        rp->freq_dims[0], rp->freq_dims[1], rp->freq_dims[2], rp->freq_dims[3]);
+                    ggml_backend_tensor_set(freq_factors, rp->freq_factors_data, 0, ggml_nbytes(freq_factors));
+                }
+
+                ggml_backend_tensor_set(pos, rp->pos_data, 0, ggml_nbytes(pos));
+
+                // ⚡ Make local copy of sections to avoid const conversion error
+                int sections_local[4];
+                for (int i = 0; i < 4; ++i) sections_local[i] = rp->sections[i];
+
+                result = ggml_rope_multi(
+                    ctx, a, pos, freq_factors,
+                    rp->n_dims,
+                    sections_local,
+                    rp->mode,
+                    rp->n_ctx_orig,
+                    rp->freq_base,
+                    rp->freq_scale,
+                    rp->ext_factor,
+                    rp->attn_factor,
+                    rp->beta_fast,
+                    rp->beta_slow);
+            } else {
+                std::cerr << "Error: Unsupported op in matrix_op_nd_tensors: " << op << std::endl;
+                return fail();
+            }
+
+            if (!result) {
+                std::cerr << "Error: GGML op returned null tensor for op: " << op << std::endl;
+                return fail();
+            }
+
+            if (backend && !ggml_backend_supports_op(backend, result)) {
+                std::cerr << "Error: backend does not support op '" << op << "' for these tensor shapes" << std::endl;
+                return fail();
+            }
+
+            // Build computation graph
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);
+            if (!gf) {
+                std::cerr << "Error: ggml_new_graph returned null in matrix_op_nd_tensors" << std::endl;
+                return fail();
+            }
+            ggml_build_forward_expand(gf, result);
+
+            // Lock device and allocate buffers
+            std::unique_lock<std::mutex> device_lock;
+            bool incremented_load = false;
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);
+                    incremented_load = true;
+                }
+            }
+
+            struct LoadGuard {
+                std::unique_lock<std::mutex>& lock;
+                std::vector<std::unique_ptr<std::atomic<uint64_t>>>& loads;
+                int idx;
+                bool dec;
+                ~LoadGuard() {
+                    if (dec && idx >= 0 && idx < (int)loads.size() && loads[idx]) {
+                        loads[idx]->fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    if (lock.owns_lock()) lock.unlock();
+                }
+            } load_guard{device_lock, device_load_ptrs, backend_index, incremented_load};
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) {
+                return fail();
+            }
+
+            ggml_backend_graph_compute(backend, gf);
+
+            // Extract result
             MatrixResult output;
-            const int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];
+            const int64_t total_result =
+                (int64_t)result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];
             output.data = std::make_unique<float[]>(total_result);
 
             output.dims[0] = result->ne[3]; // batch
@@ -1201,14 +1760,1299 @@ class llama_matrix_backend
             ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);
 
             ggml_backend_buffer_free(buf);
-            if (incremented_load && backend_index >= 0 && backend_index < (int) device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
-            }
-            if (device_lock.owns_lock()) device_lock.unlock();
 
             stat_allocs.fetch_add(1, std::memory_order_relaxed);
             return output;
         }
+
+        MatrixResult combine_matrix_shards_2d_ggml(combined_matrix_shards& combined, ggml_backend_t backend = nullptr)  
+        {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (combined.shards.empty()) {  
+                return fail();  
+            }  
+        
+            const int expected = combined.number_of_shards_needed;  
+            if (expected <= 0) {  
+                std::cerr << "Error: combine_matrix_shards_2d_ggml called without known shard count" << std::endl;  
+                return fail();  
+            }  
+            if (static_cast<int>(combined.shards.size()) != expected) {  
+                std::cerr << "Error: combine_matrix_shards_2d_ggml missing shards" << std::endl;  
+                return fail();  
+            }  
+        
+            const int join_dim = combined.join_dim;  
+            if (join_dim != 0 && join_dim != 1) {  
+                std::cerr << "Error: combine_matrix_shards_2d_ggml only supports join_dim 0 or 1" << std::endl;  
+                return fail();  
+            }  
+        
+            // Get order of shards (same as original function)  
+            std::vector<int> order;  
+            order.reserve((size_t)expected);  
+            if (combined.have_index_range && (combined.max_shard_index - combined.min_shard_index + 1 == expected)) {  
+                for (int i = combined.min_shard_index; i <= combined.max_shard_index; ++i) {  
+                    order.push_back(i);  
+                }  
+            } else {  
+                for (const auto& kv : combined.shards) {  
+                    order.push_back(kv.first);  
+                }  
+                std::sort(order.begin(), order.end());  
+            }  
+        
+            // Validate shard dimensions (same as original)  
+            int total_rows = 0;  
+            int total_cols = 0;  
+            int fixed_rows = -1;  
+            int fixed_cols = -1;  
+        
+            if (join_dim == 0) {  
+                for (int idx : order) {  
+                    const auto it = combined.shards.find(idx);  
+                    if (it == combined.shards.end()) {  
+                        std::cerr << "Error: Missing shard index during combine" << std::endl;  
+                        return fail();  
+                    }  
+                    const auto& s = it->second;  
+                    if (s.batch != 1 || s.depth != 1) {  
+                        std::cerr << "Error: combine_matrix_shards_2d_ggml expects 2D shards (batch=1, depth=1)" << std::endl;  
+                        return fail();  
+                    }  
+                    if (fixed_cols < 0) fixed_cols = s.cols;  
+                    if (s.cols != fixed_cols) {  
+                        std::cerr << "Error: Shard col mismatch for join_dim=0" << std::endl;  
+                        return fail();  
+                    }  
+                    total_rows += s.rows;  
+                }  
+                total_cols = fixed_cols;  
+            } else {  
+                for (int idx : order) {  
+                    const auto it = combined.shards.find(idx);  
+                    if (it == combined.shards.end()) {  
+                        std::cerr << "Error: Missing shard index during combine" << std::endl;  
+                        return fail();  
+                    }  
+                    const auto& s = it->second;  
+                    if (s.batch != 1 || s.depth != 1) {  
+                        std::cerr << "Error: combine_matrix_shards_2d_ggml expects 2D shards (batch=1, depth=1)" << std::endl;  
+                        return fail();  
+                    }  
+                    if (fixed_rows < 0) fixed_rows = s.rows;  
+                    if (s.rows != fixed_rows) {  
+                        std::cerr << "Error: Shard row mismatch for join_dim=1" << std::endl;  
+                        return fail();  
+                    }  
+                    total_cols += s.cols;  
+                }  
+                total_rows = fixed_rows;  
+            }  
+        
+            if (total_rows <= 0 || total_cols <= 0) {  
+                std::cerr << "Error: Invalid combined shape" << std::endl;  
+                return fail();  
+            }  
+        
+            // Select backend  
+            if (!backend) {  
+                backend = pick_least_loaded_backend();  
+            }  
+        
+            // Find backend index for load tracking  
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) {  
+                    backend_index = (int)bi;  
+                    break;  
+                }  
+            }  
+        
+            // Create GGML context  
+            struct ggml_init_params params {  
+                .mem_size   = 64 * 1024 * 1024,  
+                .mem_buffer = nullptr,  
+                .no_alloc   = true  
+            };  
+        
+            ggml_context* ctx = ggml_init(params);  
+            if (!ctx) {  
+                std::cerr << "Error: ggml_init failed in combine_matrix_shards_2d_ggml" << std::endl;  
+                return fail();  
+            }  
+        
+            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };  
+            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);  
+        
+            // Create tensors for each shard  
+            std::vector<ggml_tensor*> shard_tensors;  
+            shard_tensors.reserve(order.size());  
+        
+            for (int idx : order) {  
+                auto it = combined.shards.find(idx);  
+                if (it == combined.shards.end()) {  
+                    std::cerr << "Error: Missing shard index during tensor creation" << std::endl;  
+                    return fail();  
+                }  
+                const auto& s = it->second;  
+        
+                // Create 2D tensor for shard (GGML uses [cols, rows] ordering)  
+                ggml_tensor* shard_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.cols, s.rows);  
+                if (!shard_tensor) {  
+                    std::cerr << "Error: Failed to create shard tensor" << std::endl;  
+                    return fail();  
+                }  
+                shard_tensors.push_back(shard_tensor);  
+            }  
+        
+            // Build concatenation tree using ggml_concat  
+            ggml_tensor* result = nullptr;  
+            if (shard_tensors.size() == 1) {  
+                result = shard_tensors[0];  
+            } else {  
+                // Use pairwise concatenation to build the result  
+                result = shard_tensors[0];  
+                for (size_t i = 1; i < shard_tensors.size(); ++i) {  
+                    // Convert join_dim to GGML dimension (0=cols, 1=rows in GGML)  
+                    int ggml_dim = (join_dim == 0) ? 1 : 0; // join_dim 0 (rows) -> GGML dim 1, join_dim 1 (cols) -> GGML dim 0  
+                    result = ggml_concat(ctx, result, shard_tensors[i], ggml_dim);  
+                    if (!result) {  
+                        std::cerr << "Error: ggml_concat failed" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+            }  
+        
+            // Build computation graph  
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);  
+            ggml_build_forward_expand(gf, result);  
+        
+            // Lock device and allocate buffers  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+        
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                }  
+                std::cerr << "Error: Failed to allocate backend buffers" << std::endl;  
+                return fail();  
+            }  
+        
+            // Copy shard data to tensors  
+            for (size_t i = 0; i < shard_tensors.size(); ++i) {  
+                int idx = order[i];  
+                auto it = combined.shards.find(idx);  
+                if (it == combined.shards.end() || !it->second.data) {  
+                    std::cerr << "Error: Missing shard data during tensor copy" << std::endl;  
+                    ggml_backend_buffer_free(buf);  
+                    if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                        device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                    }  
+                    return fail();  
+                }  
+                
+                const auto& s = it->second;  
+                ggml_backend_tensor_set(shard_tensors[i], s.data.get(), 0, s.rows * s.cols * sizeof(float));  
+            }  
+        
+            // Execute computation  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result  
+            MatrixResult output;  
+            const int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
+            output.data = std::make_unique<float[]>(total_result);  
+        
+            // Convert GGML dimensions back to MatrixResult format  
+            output.dims[0] = result->ne[3]; // batch  
+            output.dims[1] = result->ne[2]; // depth    
+            output.dims[2] = result->ne[1]; // rows  
+            output.dims[3] = result->ne[0]; // cols  
+        
+            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);  
+        
+            // Cleanup  
+            ggml_backend_buffer_free(buf);  
+            if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+            }  
+            if (device_lock.owns_lock()) device_lock.unlock();  
+        
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+        MatrixResult combine_matrix_shards_grid_2d_ggml(combined_matrix_shards& combined, ggml_backend_t backend = nullptr)  
+        {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (combined.shards.empty()) {  
+                return fail();  
+            }  
+        
+            const int expected = combined.number_of_shards_needed;  
+            if (expected <= 0) {  
+                std::cerr << "Error: combine_matrix_shards_grid_2d_ggml called without known shard count" << std::endl;  
+                return fail();  
+            }  
+            if (static_cast<int>(combined.shards.size()) != expected) {  
+                std::cerr << "Error: combine_matrix_shards_grid_2d_ggml missing shards" << std::endl;  
+                return fail();  
+            }  
+        
+            // System-2 dispatch is a 2 x N grid  
+            constexpr int row_parts = 2;  
+            if (expected % row_parts != 0) {  
+                std::cerr << "Error: System-2 grid expects an even number of shards" << std::endl;  
+                return fail();  
+            }  
+            const int col_parts = expected / row_parts;  
+        
+            // Validate contiguous shard indices  
+            int min_i = 0;  
+            int max_i = -1;  
+            if (combined.have_index_range) {  
+                min_i = combined.min_shard_index;  
+                max_i = combined.max_shard_index;  
+            } else {  
+                min_i = std::numeric_limits<int>::max();  
+                max_i = std::numeric_limits<int>::min();  
+                for (const auto& kv : combined.shards) {  
+                    min_i = std::min(min_i, kv.first);  
+                    max_i = std::max(max_i, kv.first);  
+                }  
+            }  
+        
+            if (max_i - min_i + 1 != expected) {  
+                std::cerr << "Error: System-2 combine expects contiguous shard indices; got gaps" << std::endl;  
+                return fail();  
+            }  
+        
+            // Build grid of shard pointers  
+            std::vector<combined_matrix_shards::ShardView*> grid((size_t)expected, nullptr);  
+            for (int i = min_i; i <= max_i; ++i) {  
+                auto it = combined.shards.find(i);  
+                if (it == combined.shards.end()) {  
+                    std::cerr << "Error: Missing System-2 shard index during combine" << std::endl;  
+                    return fail();  
+                }  
+                grid[(size_t)(i - min_i)] = &it->second;  
+            }  
+        
+            // Validate 2D shard dimensions  
+            std::vector<int> row_heights((size_t)row_parts, 0);  
+            std::vector<int> col_widths((size_t)col_parts, 0);  
+        
+            for (int r = 0; r < row_parts; ++r) {  
+                auto* t0 = grid[(size_t)(r * col_parts)];  
+                if (!t0) {  
+                    std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                    return fail();  
+                }  
+                if (t0->batch != 1 || t0->depth != 1) {  
+                    std::cerr << "Error: System-2 combine expects 2D shards (batch=1, depth=1)" << std::endl;  
+                    return fail();  
+                }  
+                row_heights[(size_t)r] = t0->rows;  
+                for (int c = 0; c < col_parts; ++c) {  
+                    auto* blk = grid[(size_t)(r * col_parts + c)];  
+                    if (!blk) {  
+                        std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                        return fail();  
+                    }  
+                    if (blk->batch != 1 || blk->depth != 1) {  
+                        std::cerr << "Error: System-2 combine expects 2D shards (batch=1, depth=1)" << std::endl;  
+                        return fail();  
+                    }  
+                    if (blk->rows != row_heights[(size_t)r]) {  
+                        std::cerr << "Error: System-2 row-block height mismatch within same row" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+            }  
+        
+            for (int c = 0; c < col_parts; ++c) {  
+                auto* t0 = grid[(size_t)c];  
+                if (!t0) {  
+                    std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                    return fail();  
+                }  
+                col_widths[(size_t)c] = t0->cols;  
+                for (int r = 0; r < row_parts; ++r) {  
+                    auto* blk = grid[(size_t)(r * col_parts + c)];  
+                    if (!blk) {  
+                        std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                        return fail();  
+                    }  
+                    if (blk->cols != col_widths[(size_t)c]) {  
+                        std::cerr << "Error: System-2 col-block width mismatch within same column" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+            }  
+        
+            // Calculate total dimensions  
+            int total_rows = 0;  
+            for (int r = 0; r < row_parts; ++r) total_rows += row_heights[(size_t)r];  
+            int total_cols = 0;  
+            for (int c = 0; c < col_parts; ++c) total_cols += col_widths[(size_t)c];  
+        
+            if (total_rows <= 0 || total_cols <= 0) {  
+                std::cerr << "Error: Invalid System-2 combined shape" << std::endl;  
+                return fail();  
+            }  
+        
+            // Select backend  
+            if (!backend) {  
+                backend = pick_least_loaded_backend();  
+            }  
+        
+            // Find backend index for load tracking  
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) {  
+                    backend_index = (int)bi;  
+                    break;  
+                }  
+            }  
+        
+            // Create GGML context  
+            struct ggml_init_params params {  
+                .mem_size   = 16 * 1024 * 1024,  
+                .mem_buffer = nullptr,  
+                .no_alloc   = true  
+            };  
+        
+            ggml_context* ctx = ggml_init(params);  
+            if (!ctx) {  
+                std::cerr << "Error: ggml_init failed in combine_matrix_shards_grid_2d_ggml" << std::endl;  
+                return fail();  
+            }  
+        
+            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };  
+            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);  
+        
+            // Create tensors for each shard  
+            std::vector<ggml_tensor*> shard_tensors;  
+            shard_tensors.reserve(expected);  
+        
+            for (int i = 0; i < expected; ++i) {  
+                auto* shard = grid[(size_t)i];  
+                if (!shard) {  
+                    std::cerr << "Error: Missing shard during tensor creation" << std::endl;  
+                    return fail();  
+                }  
+        
+                // Create 2D tensor for shard (GGML uses [cols, rows] ordering)  
+                ggml_tensor* shard_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shard->cols, shard->rows);  
+                if (!shard_tensor) {  
+                    std::cerr << "Error: Failed to create shard tensor" << std::endl;  
+                    return fail();  
+                }  
+                shard_tensors.push_back(shard_tensor);  
+            }  
+        
+            // Build grid using hierarchical concatenation  
+            std::vector<ggml_tensor*> row_tensors;  
+            row_tensors.reserve(row_parts);  
+        
+            // First, concatenate shards within each row (horizontal concatenation)  
+            for (int r = 0; r < row_parts; ++r) {  
+                ggml_tensor* row_result = shard_tensors[(size_t)(r * col_parts)];  
+                for (int c = 1; c < col_parts; ++c) {  
+                    row_result = ggml_concat(ctx, row_result, shard_tensors[(size_t)(r * col_parts + c)], 0); // dim 0 = cols  
+                    if (!row_result) {  
+                        std::cerr << "Error: ggml_concat failed for row assembly" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+                row_tensors.push_back(row_result);  
+            }  
+        
+            // Then concatenate all rows (vertical concatenation)  
+            ggml_tensor* result = row_tensors[0];  
+            for (int r = 1; r < row_parts; ++r) {  
+                result = ggml_concat(ctx, result, row_tensors[(size_t)r], 1); // dim 1 = rows  
+                if (!result) {  
+                    std::cerr << "Error: ggml_concat failed for final assembly" << std::endl;  
+                    return fail();  
+                }  
+            }  
+        
+            // Build computation graph  
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);  
+            ggml_build_forward_expand(gf, result);  
+        
+            // Lock device and allocate buffers  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+        
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                }  
+                std::cerr << "Error: Failed to allocate backend buffers" << std::endl;  
+                return fail();  
+            }  
+        
+            // Copy shard data to tensors  
+            for (int i = 0; i < expected; ++i) {  
+                auto* shard = grid[(size_t)i];  
+                if (!shard || !shard->data) {  
+                    std::cerr << "Error: Missing shard data during tensor copy" << std::endl;  
+                    ggml_backend_buffer_free(buf);  
+                    if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                        device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                    }  
+                    return fail();  
+                }  
+                
+                ggml_backend_tensor_set(shard_tensors[(size_t)i], shard->data.get(), 0,   
+                                    shard->rows * shard->cols * sizeof(float));  
+            }  
+        
+            // Execute computation  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result  
+            MatrixResult output;  
+            const int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
+            output.data = std::make_unique<float[]>(total_result);  
+        
+            // Convert GGML dimensions back to MatrixResult format  
+            output.dims[0] = result->ne[3]; // batch  
+            output.dims[1] = result->ne[2]; // depth    
+            output.dims[2] = result->ne[1]; // rows  
+            output.dims[3] = result->ne[0]; // cols  
+        
+            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);  
+        
+            // Cleanup  
+            ggml_backend_buffer_free(buf);  
+            if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+            }  
+            if (device_lock.owns_lock()) device_lock.unlock();  
+        
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+        MatrixResult combine_flash_attn_shards_ggml(combined_matrix_shards& combined, ggml_backend_t backend = nullptr) {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (combined.shards.empty()) return fail();  
+            const int expected = combined.number_of_shards_needed;  
+            if (expected <= 0 || static_cast<int>(combined.shards.size()) != expected) return fail();  
+        
+            const int join_dim = combined.join_dim;  
+            if (join_dim < 0 || join_dim >= 4) {  
+                std::cerr << "Error: join_dim must be in [0,3]" << std::endl;  
+                return fail();  
+            }  
+            // combined.join_dim is in incoming shard order: [batch, depth, rows, cols].  
+            // ggml tensors are ordered as [cols, rows, depth, batch].  
+            const int join_dim_ggml = 3 - join_dim;  
+        
+            // Determine shard order  
+            std::vector<int> order;  
+            order.reserve(expected);  
+            if (combined.have_index_range && (combined.max_shard_index - combined.min_shard_index + 1 == expected)) {  
+                for (int i = combined.min_shard_index; i <= combined.max_shard_index; ++i) order.push_back(i);  
+            } else {  
+                for (const auto& kv : combined.shards) order.push_back(kv.first);  
+                std::sort(order.begin(), order.end());  
+            }  
+        
+            // Helper to get shard shape as array  
+            auto shard_shape = [](const combined_matrix_shards::ShardView& s) -> std::array<int64_t, 4> {  
+                return { (int64_t)s.cols, (int64_t)s.rows, (int64_t)s.depth, (int64_t)s.batch };  
+            };  
+
+            // Pick a GGML type based on the shard dtype tag (payloads are stored as f32 internally).
+            auto dtype_tag_to_ggml = [](int tag) -> ggml_type {
+                if (tag == -2) return GGML_TYPE_F16;
+                if (tag == -3) return GGML_TYPE_BF16;
+                return GGML_TYPE_F32;
+            };
+            int dtype_tag = combined.output_dtype_tag;
+            if (!combined.shards.empty()) {
+                dtype_tag = combined.shards.begin()->second.dtype_tag;
+            }
+            const ggml_type data_type = dtype_tag_to_ggml(dtype_tag);
+            const size_t type_size = ggml_type_size(data_type);
+        
+            // Validate dimensions and compute output shape  
+            std::array<int64_t, 4> out_shape = {0, 0, 0, 0};  
+            std::array<int64_t, 4> ref_shape = {0, 0, 0, 0};  
+            bool first = true;  
+            for (int idx : order) {  
+                auto it = combined.shards.find(idx);  
+                if (it == combined.shards.end()) return fail();  
+                const auto& s = it->second;  
+                auto shape = shard_shape(s);  
+                if (first) {  
+                    ref_shape = shape;  
+                    first = false;  
+                } else {  
+                    for (int d = 0; d < 4; ++d) {  
+                        if (d != join_dim_ggml && shape[d] != ref_shape[d]) {  
+                            std::cerr << "Error: Shard dimension mismatch at dim " << d << std::endl;  
+                            return fail();  
+                        }  
+                    }  
+                }  
+                out_shape[join_dim_ggml] += shape[join_dim_ggml];  
+            }  
+            for (int d = 0; d < 4; ++d) {  
+                if (d != join_dim_ggml) out_shape[d] = ref_shape[d];  
+            }  
+        
+            // Backend selection  
+            if (!backend) backend = pick_least_loaded_backend();  
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) { backend_index = (int)bi; break; }  
+            }  
+        
+            // GGML context  
+            ggml_init_params params{ .mem_size = 64 * 1024 * 1024, .mem_buffer = nullptr, .no_alloc = true };  
+            ggml_context* ctx = ggml_init(params);  
+            if (!ctx) return fail();  
+            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };  
+            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);  
+        
+            // Create tensors for each shard with original dimensions  
+            std::vector<ggml_tensor*> shard_tensors;  
+            shard_tensors.reserve(order.size());  
+            for (int idx : order) {  
+                auto it = combined.shards.find(idx);  
+                if (it == combined.shards.end()) return fail();  
+                const auto& s = it->second;  
+                auto shape = shard_shape(s);  
+                ggml_tensor* shard_tensor = ggml_new_tensor(ctx, data_type, 4, shape.data());  
+                if (!shard_tensor) return fail();  
+                // Explicit strides for clarity (cols, rows, depth, batch).
+                shard_tensor->nb[0] = type_size;
+                shard_tensor->nb[1] = shard_tensor->nb[0] * shape[0];
+                shard_tensor->nb[2] = shard_tensor->nb[1] * shape[1];
+                shard_tensor->nb[3] = shard_tensor->nb[2] * shape[2];
+                shard_tensors.push_back(shard_tensor);  
+            }  
+        
+            // Concatenate along join_dim  
+            ggml_tensor* result = shard_tensors[0];  
+            for (size_t i = 1; i < shard_tensors.size(); ++i) {  
+                result = ggml_concat(ctx, result, shard_tensors[i], join_dim_ggml);  
+                if (!result) return fail();  
+            }  
+        
+            // Build graph and allocate  
+            ggml_cgraph* gf = ggml_new_graph(ctx);  
+            ggml_build_forward_expand(gf, result);  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index])  
+                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                return fail();  
+            }  
+        
+            // Copy shard data  
+            for (size_t i = 0; i < shard_tensors.size(); ++i) {  
+                int idx = order[i];  
+                auto it = combined.shards.find(idx);  
+                if (it == combined.shards.end() || !it->second.data) {  
+                    ggml_backend_buffer_free(buf);  
+                    if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index])  
+                        device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                    return fail();  
+                }  
+                const auto& s = it->second;  
+                auto shape = shard_shape(s);  
+                int64_t total_elems = shape[0] * shape[1] * shape[2] * shape[3];  
+                if (data_type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(
+                        shard_tensors[i], s.data.get(), 0,
+                        (size_t)total_elems * sizeof(float));
+                } else if (data_type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> tmp((size_t)total_elems);
+                    ggml_fp32_to_fp16_row(s.data.get(), tmp.data(), total_elems);
+                    ggml_backend_tensor_set(
+                        shard_tensors[i], tmp.data(), 0,
+                        (size_t)total_elems * sizeof(ggml_fp16_t));
+                } else if (data_type == GGML_TYPE_BF16) {
+                    std::vector<uint16_t> tmp((size_t)total_elems);
+                    for (int64_t j = 0; j < total_elems; ++j) {
+                        tmp[(size_t)j] = float_to_bf16_bits(s.data[j]);
+                    }
+                    ggml_backend_tensor_set(
+                        shard_tensors[i], tmp.data(), 0,
+                        (size_t)total_elems * sizeof(uint16_t));
+                } else {
+                    ggml_backend_tensor_set(
+                        shard_tensors[i], s.data.get(), 0,
+                        (size_t)total_elems * sizeof(float));
+                }
+            }  
+        
+            // Execute  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result (convert GGML [cols, rows, depth, batch] -> [batch, depth, rows, cols])
+            MatrixResult output;  
+            int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
+            output.dims[0] = (int)result->ne[3]; // batch
+            output.dims[1] = (int)result->ne[2]; // depth
+            output.dims[2] = (int)result->ne[1]; // rows
+            output.dims[3] = (int)result->ne[0]; // cols
+            output.data = std::make_unique<float[]>(total_result);
+            if (data_type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(
+                    result, output.data.get(), 0,
+                    sizeof(float) * (size_t)total_result);
+            } else if (data_type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp((size_t)total_result);
+                ggml_backend_tensor_get(
+                    result, tmp.data(), 0,
+                    sizeof(ggml_fp16_t) * (size_t)total_result);
+                ggml_fp16_to_fp32_row(tmp.data(), output.data.get(), total_result);
+            } else if (data_type == GGML_TYPE_BF16) {
+                std::vector<uint16_t> tmp((size_t)total_result);
+                ggml_backend_tensor_get(
+                    result, tmp.data(), 0,
+                    sizeof(uint16_t) * (size_t)total_result);
+                for (int64_t j = 0; j < total_result; ++j) {
+                    output.data[(size_t)j] = bf16_bits_to_float(tmp[(size_t)j]);
+                }
+            } else {
+                ggml_backend_tensor_get(
+                    result, output.data.get(), 0,
+                    sizeof(float) * (size_t)total_result);
+            }
+        
+            // Cleanup  
+            ggml_backend_buffer_free(buf);  
+            if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index])  
+                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+            if (device_lock.owns_lock()) device_lock.unlock();  
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+        MatrixResult combine_flash_attn_shards_grid_2d_ggml(combined_matrix_shards& combined, ggml_backend_t backend = nullptr)  
+        {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (combined.shards.empty()) {  
+                return fail();  
+            }  
+        
+            const int expected = combined.number_of_shards_needed;  
+            if (expected <= 0) {  
+                std::cerr << "Error: combine_flash_attn_shards_grid_2d_ggml called without known shard count" << std::endl;  
+                return fail();  
+            }  
+            if (static_cast<int>(combined.shards.size()) != expected) {  
+                std::cerr << "Error: combine_flash_attn_shards_grid_2d_ggml missing shards" << std::endl;  
+                return fail();  
+            }  
+        
+            // System-2 dispatch is a 2 x N grid  
+            constexpr int row_parts = 2;  
+            if (expected % row_parts != 0) {  
+                std::cerr << "Error: System-2 grid expects an even number of shards" << std::endl;  
+                return fail();  
+            }  
+            const int col_parts = expected / row_parts;  
+        
+            // Validate contiguous shard indices  
+            int min_i = 0;  
+            int max_i = -1;  
+            if (combined.have_index_range) {  
+                min_i = combined.min_shard_index;  
+                max_i = combined.max_shard_index;  
+            } else {  
+                min_i = std::numeric_limits<int>::max();  
+                max_i = std::numeric_limits<int>::min();  
+                for (const auto& kv : combined.shards) {  
+                    min_i = std::min(min_i, kv.first);  
+                    max_i = std::max(max_i, kv.first);  
+                }  
+            }  
+        
+            if (max_i - min_i + 1 != expected) {  
+                std::cerr << "Error: System-2 combine expects contiguous shard indices; got gaps" << std::endl;  
+                return fail();  
+            }  
+        
+            // Build grid of shard pointers  
+            std::vector<combined_matrix_shards::ShardView*> grid((size_t)expected, nullptr);  
+            for (int i = min_i; i <= max_i; ++i) {  
+                auto it = combined.shards.find(i);  
+                if (it == combined.shards.end()) {  
+                    std::cerr << "Error: Missing System-2 shard index during combine" << std::endl;  
+                    return fail();  
+                }  
+                grid[(size_t)(i - min_i)] = &it->second;  
+            }  
+        
+            // FlashAttention-specific row calculation  
+            auto rows2d = [](const combined_matrix_shards::ShardView& s) -> int64_t {  
+                return (int64_t)s.batch * (int64_t)s.depth * (int64_t)s.rows;  
+            };  
+        
+            // Validate grid dimensions with FlashAttention flattening  
+            std::vector<int64_t> row_heights((size_t)row_parts, 0);  
+            std::vector<int> col_widths((size_t)col_parts, 0);  
+        
+            for (int r = 0; r < row_parts; ++r) {  
+                auto* t0 = grid[(size_t)(r * col_parts)];  
+                if (!t0) {  
+                    std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                    return fail();  
+                }  
+                const int64_t r2 = rows2d(*t0);  
+                if (r2 <= 0 || r2 > std::numeric_limits<int>::max()) {  
+                    std::cerr << "Error: Invalid System-2 shard height during flash combine" << std::endl;  
+                    return fail();  
+                }  
+                row_heights[(size_t)r] = r2;  
+                for (int c = 0; c < col_parts; ++c) {  
+                    auto* blk = grid[(size_t)(r * col_parts + c)];  
+                    if (!blk) {  
+                        std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                        return fail();  
+                    }  
+                    const int64_t bh = rows2d(*blk);  
+                    if (bh != row_heights[(size_t)r]) {  
+                        std::cerr << "Error: System-2 row-block height mismatch within same row" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+            }  
+        
+            for (int c = 0; c < col_parts; ++c) {  
+                auto* t0 = grid[(size_t)c];  
+                if (!t0) {  
+                    std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                    return fail();  
+                }  
+                col_widths[(size_t)c] = t0->cols;  
+                for (int r = 0; r < row_parts; ++r) {  
+                    auto* blk = grid[(size_t)(r * col_parts + c)];  
+                    if (!blk) {  
+                        std::cerr << "Error: Missing System-2 shard block" << std::endl;  
+                        return fail();  
+                    }  
+                    if (blk->cols != col_widths[(size_t)c]) {  
+                        std::cerr << "Error: System-2 col-block width mismatch within same column" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+            }  
+        
+            // Calculate total dimensions  
+            int64_t total_rows = 0;  
+            for (int r = 0; r < row_parts; ++r) total_rows += row_heights[(size_t)r];  
+            int total_cols = 0;  
+            for (int c = 0; c < col_parts; ++c) total_cols += col_widths[(size_t)c];  
+        
+            if (total_rows <= 0 || total_cols <= 0) {  
+                std::cerr << "Error: Invalid System-2 combined shape" << std::endl;  
+                return fail();  
+            }  
+            if (total_rows > std::numeric_limits<int>::max()) {  
+                std::cerr << "Error: Flash combined rows exceed int range" << std::endl;  
+                return fail();  
+            }  
+        
+            // Select backend  
+            if (!backend) {  
+                backend = pick_least_loaded_backend();  
+            }  
+        
+            // Find backend index for load tracking  
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) {  
+                    backend_index = (int)bi;  
+                    break;  
+                }  
+            }  
+        
+            // Create GGML context  
+            struct ggml_init_params params {  
+                .mem_size   = 16 * 1024 * 1024,  
+                .mem_buffer = nullptr,  
+                .no_alloc   = true  
+            };  
+        
+            ggml_context* ctx = ggml_init(params);  
+            if (!ctx) {  
+                std::cerr << "Error: ggml_init failed in combine_flash_attn_shards_grid_2d_ggml" << std::endl;  
+                return fail();  
+            }  
+        
+            auto ctx_deleter = [](struct ggml_context* p) { if (p) ggml_free(p); };  
+            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);  
+        
+            // Create tensors for each shard (flattened to 2D)  
+            std::vector<ggml_tensor*> shard_tensors;  
+            shard_tensors.reserve(expected);  
+        
+            for (int i = 0; i < expected; ++i) {  
+                auto* shard = grid[(size_t)i];  
+                if (!shard) {  
+                    std::cerr << "Error: Missing shard during tensor creation" << std::endl;  
+                    return fail();  
+                }  
+                const int64_t r2 = rows2d(*shard);  
+        
+                // Create 2D tensor for flattened shard (GGML uses [cols, rows] ordering)  
+                ggml_tensor* shard_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shard->cols, (int)r2);  
+                if (!shard_tensor) {  
+                    std::cerr << "Error: Failed to create shard tensor" << std::endl;  
+                    return fail();  
+                }  
+                shard_tensors.push_back(shard_tensor);  
+            }  
+        
+            // Build grid using hierarchical concatenation  
+            std::vector<ggml_tensor*> row_tensors;  
+            row_tensors.reserve(row_parts);  
+        
+            // First, concatenate shards within each row (horizontal concatenation)  
+            for (int r = 0; r < row_parts; ++r) {  
+                ggml_tensor* row_result = shard_tensors[(size_t)(r * col_parts)];  
+                for (int c = 1; c < col_parts; ++c) {  
+                    row_result = ggml_concat(ctx, row_result, shard_tensors[(size_t)(r * col_parts + c)], 0); // dim 0 = cols  
+                    if (!row_result) {  
+                        std::cerr << "Error: ggml_concat failed for row assembly" << std::endl;  
+                        return fail();  
+                    }  
+                }  
+                row_tensors.push_back(row_result);  
+            }  
+        
+            // Then concatenate all rows (vertical concatenation)  
+            ggml_tensor* result = row_tensors[0];  
+            for (int r = 1; r < row_parts; ++r) {  
+                result = ggml_concat(ctx, result, row_tensors[(size_t)r], 1); // dim 1 = rows  
+                if (!result) {  
+                    std::cerr << "Error: ggml_concat failed for final assembly" << std::endl;  
+                    return fail();  
+                }  
+            }  
+        
+            // Build computation graph  
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);  
+            ggml_build_forward_expand(gf, result);  
+        
+            // Lock device and allocate buffers  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+        
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                }  
+                std::cerr << "Error: Failed to allocate backend buffers" << std::endl;  
+                return fail();  
+            }  
+        
+            // Copy shard data to tensors  
+            for (int i = 0; i < expected; ++i) {  
+                auto* shard = grid[(size_t)i];  
+                if (!shard || !shard->data) {  
+                    std::cerr << "Error: Missing shard data during tensor copy" << std::endl;  
+                    ggml_backend_buffer_free(buf);  
+                    if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                        device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+                    }  
+                    return fail();  
+                }  
+                
+                const int64_t r2 = rows2d(*shard);  
+                ggml_backend_tensor_set(shard_tensors[(size_t)i], shard->data.get(), 0,   
+                                    r2 * shard->cols * sizeof(float));  
+            }  
+        
+            // Execute computation  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result  
+            MatrixResult output;  
+            const int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
+            output.data = std::make_unique<float[]>(total_result);  
+        
+            // Convert GGML dimensions back to MatrixResult format (flattened to 2D)  
+            output.dims[0] = 1;  
+            output.dims[1] = 1;  
+            output.dims[2] = (int)result->ne[1]; // rows (flattened)  
+            output.dims[3] = (int)result->ne[0]; // cols  
+        
+            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);  
+        
+            // Cleanup  
+            ggml_backend_buffer_free(buf);  
+            if (incremented_load && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);  
+            }  
+            if (device_lock.owns_lock()) device_lock.unlock();  
+        
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+        // Reshape function that works with your existing MatrixResult pattern  
+        MatrixResult reshape_nd(  
+            float* matrix, const int input_dims[4],   
+            const int output_dims[4],  
+            ggml_backend_t backend = nullptr)  
+        {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (!matrix) {  
+                std::cerr << "Error: reshape_nd got null matrix" << std::endl;  
+                return fail();  
+            }  
+        
+            // Validate input dimensions  
+            for (int i = 0; i < 4; i++) {  
+                if (input_dims[i] == 0) {  
+                    std::cerr << "Error: Zero dimension in input_dims[" << i << "]" << std::endl;  
+                    return fail();  
+                }  
+            }  
+        
+            // Validate output dimensions (allow one -1 to infer)
+            int inferred_idx = -1;
+            for (int i = 0; i < 4; i++) {
+                if (output_dims[i] == 0) {
+                    std::cerr << "Error: Zero dimension in output_dims[" << i << "]" << std::endl;
+                    return fail();
+                }
+                if (output_dims[i] < 0) {
+                    if (inferred_idx != -1) {
+                        std::cerr << "Error: More than one -1 in output_dims" << std::endl;
+                        return fail();
+                    }
+                    inferred_idx = i;
+                }
+            }
+
+            // Check that total elements match (with optional inference)
+            int64_t input_total = (int64_t)input_dims[0] * input_dims[1] * input_dims[2] * input_dims[3];
+            int64_t output_total = 1;
+            for (int i = 0; i < 4; i++) {
+                if (i == inferred_idx) continue;
+                output_total *= (int64_t)output_dims[i];
+            }
+
+            int output_dims_local[4] = { output_dims[0], output_dims[1], output_dims[2], output_dims[3] };
+            if (inferred_idx >= 0) {
+                if (output_total == 0 || input_total % output_total != 0) {
+                    std::cerr << "Error: Cannot infer output dim (input_total="
+                              << input_total << ", known_product=" << output_total << ")" << std::endl;
+                    return fail();
+                }
+                output_dims_local[inferred_idx] = (int)(input_total / output_total);
+            }
+
+            int64_t output_total_check = (int64_t)output_dims_local[0] * output_dims_local[1] * output_dims_local[2] * output_dims_local[3];
+            if (input_total != output_total_check) {
+                std::cerr << "Error: Cannot reshape - element count mismatch. Input: "
+                          << input_total << ", Output: " << output_total_check << std::endl;
+                return fail();
+            }
+        
+            if (!backend) {  
+                backend = pick_least_loaded_backend();  
+            }  
+        
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) {  
+                    backend_index = (int)bi;  
+                    break;  
+                }  
+            }  
+        
+            ggml_context* ctx = get_thread_graph_ctx(0, false);  
+            if (!ctx) {  
+                std::cerr << "Error: get_thread_graph_ctx failed in reshape_nd" << std::endl;  
+                return fail();  
+            }  
+        
+            // Create input tensor  
+            ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,  
+                input_dims[0], input_dims[1], input_dims[2], input_dims[3]);  
+            if (!input) return fail();  
+        
+            // Create reshape operation using GGML's reshape function  
+            ggml_tensor* reshaped = ggml_reshape_4d(ctx, input,   
+                output_dims_local[0], output_dims_local[1], output_dims_local[2], output_dims_local[3]);  
+            if (!reshaped) {  
+                std::cerr << "Error: ggml_reshape_4d failed" << std::endl;  
+                return fail();  
+            }  
+        
+            // Build and execute computation graph  
+            ggml_cgraph* gf = ggml_new_graph(ctx);  
+            if (!gf) {  
+                std::cerr << "Error: ggml_new_graph returned null in reshape_nd" << std::endl;  
+                return fail();  
+            }  
+            ggml_build_forward_expand(gf, reshaped);  
+        
+            // Device locking  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+        
+            struct LoadGuard {  
+                std::unique_lock<std::mutex>& lock;  
+                std::vector<std::unique_ptr<std::atomic<uint64_t>>>& loads;  
+                int idx;  
+                bool dec;  
+                ~LoadGuard() {  
+                    if (dec && idx >= 0 && idx < (int)loads.size() && loads[idx]) {  
+                        loads[idx]->fetch_sub(1, std::memory_order_relaxed);  
+                    }  
+                    if (lock.owns_lock()) lock.unlock();  
+                }  
+            } load_guard{device_lock, device_load_ptrs, backend_index, incremented_load};  
+        
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                return fail();  
+            }  
+        
+            // Set input data  
+            ggml_backend_tensor_set(input, matrix, 0, ggml_nbytes(input));  
+        
+            // Execute reshape (zero-copy operation)  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result  
+            MatrixResult output;  
+            const int64_t output_total_final = output_total_check;
+            if (output_total_final <= 0) {
+                std::cerr << "Error: reshape_nd produced non-positive output size" << std::endl;
+                return fail();
+            }
+            output.data = std::make_unique<float[]>(static_cast<size_t>(output_total_final));  
+            output.dims[0] = output_dims_local[3]; // batch  
+            output.dims[1] = output_dims_local[2]; // depth    
+            output.dims[2] = output_dims_local[1]; // rows  
+            output.dims[3] = output_dims_local[0]; // cols  
+        
+            ggml_backend_tensor_get(reshaped, output.data.get(), 0, output_total_final * sizeof(float));  
+        
+            ggml_backend_buffer_free(buf);  
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+
+        // Repeat function that tiles tensor elements along specified dimensions  
+        MatrixResult repeat_nd(  
+            float* matrix, const int input_dims[4],  
+            const int repeat_dims[4],  
+            ggml_backend_t backend = nullptr)  
+        {  
+            stat_ops.fetch_add(1, std::memory_order_relaxed);  
+        
+            const auto fail = [&]() -> MatrixResult {  
+                return { nullptr, {0, 0, 0, 0} };  
+            };  
+        
+            if (!matrix) {  
+                std::cerr << "Error: repeat_nd got null matrix" << std::endl;  
+                return fail();  
+            }  
+        
+            // Validate input dimensions  
+            for (int i = 0; i < 4; i++) {  
+                if (input_dims[i] == 0) {  
+                    std::cerr << "Error: Zero dimension in input_dims[" << i << "]" << std::endl;  
+                    return fail();  
+                }  
+                if (repeat_dims[i] <= 0) {  
+                    std::cerr << "Error: Non-positive repeat_dims[" << i << "]" << std::endl;  
+                    return fail();  
+                }  
+            }  
+        
+            if (!backend) {  
+                backend = pick_least_loaded_backend();  
+            }  
+        
+            int backend_index = -1;  
+            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {  
+                if (ggml_backends[bi] == backend) {  
+                    backend_index = (int)bi;  
+                    break;  
+                }  
+            }  
+        
+            ggml_context* ctx = get_thread_graph_ctx(0, false);  
+            if (!ctx) {  
+                std::cerr << "Error: get_thread_graph_ctx failed in repeat_nd" << std::endl;  
+                return fail();  
+            }  
+        
+            // Create input tensor  
+            ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,  
+                input_dims[0], input_dims[1], input_dims[2], input_dims[3]);  
+            if (!input) return fail();  
+        
+            // Calculate output dimensions  
+            int64_t output_dims[4] = {  
+                input_dims[0] * repeat_dims[0],  
+                input_dims[1] * repeat_dims[1],  
+                input_dims[2] * repeat_dims[2],  
+                input_dims[3] * repeat_dims[3]  
+            };  
+        
+            // Create repeat operation using GGML's repeat function  
+            ggml_tensor* repeated = ggml_repeat_4d(ctx, input,  
+                output_dims[0], output_dims[1], output_dims[2], output_dims[3]);  
+            if (!repeated) {  
+                std::cerr << "Error: ggml_repeat_4d failed" << std::endl;  
+                return fail();  
+            }  
+        
+            // Build and execute computation graph  
+            ggml_cgraph* gf = ggml_new_graph(ctx);  
+            if (!gf) {  
+                std::cerr << "Error: ggml_new_graph returned null in repeat_nd" << std::endl;  
+                return fail();  
+            }  
+            ggml_build_forward_expand(gf, repeated);  
+        
+            // Device locking  
+            std::unique_lock<std::mutex> device_lock;  
+            bool incremented_load = false;  
+            if (backend_index >= 0 && backend_index < (int)device_mutexes.size() && device_mutexes[backend_index]) {  
+                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);  
+                if (backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {  
+                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);  
+                    incremented_load = true;  
+                }  
+            }  
+        
+            struct LoadGuard {  
+                std::unique_lock<std::mutex>& lock;  
+                std::vector<std::unique_ptr<std::atomic<uint64_t>>>& loads;  
+                int idx;  
+                bool dec;  
+                ~LoadGuard() {  
+                    if (dec && idx >= 0 && idx < (int)loads.size() && loads[idx]) {  
+                        loads[idx]->fetch_sub(1, std::memory_order_relaxed);  
+                    }  
+                    if (lock.owns_lock()) lock.unlock();  
+                }  
+            } load_guard{device_lock, device_load_ptrs, backend_index, incremented_load};  
+        
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
+            if (!buf) {  
+                return fail();  
+            }  
+        
+            // Set input data  
+            ggml_backend_tensor_set(input, matrix, 0, ggml_nbytes(input));  
+        
+            // Execute repeat operation  
+            ggml_backend_graph_compute(backend, gf);  
+        
+            // Extract result  
+            MatrixResult output;  
+            const int64_t output_total = output_dims[0] * output_dims[1] * output_dims[2] * output_dims[3];  
+            if (output_total <= 0) {  
+                std::cerr << "Error: repeat_nd produced non-positive output size" << std::endl;  
+                return fail();  
+            }  
+            output.data = std::make_unique<float[]>(static_cast<size_t>(output_total));  
+            output.dims[0] = output_dims[3]; // batch  
+            output.dims[1] = output_dims[2]; // depth  
+            output.dims[2] = output_dims[1]; // rows  
+            output.dims[3] = output_dims[0]; // cols  
+        
+            ggml_backend_tensor_get(repeated, output.data.get(), 0, output_total * sizeof(float));  
+        
+            ggml_backend_buffer_free(buf);  
+            stat_allocs.fetch_add(1, std::memory_order_relaxed);  
+            return output;  
+        }
+
+
+
+
+
+
 };
 
 // =====================================================================================
@@ -1487,166 +3331,3 @@ static inline void set_VRAM_buffers(llama_matrix_backend& llama_backend) {
         });
     }
 }
-
-/*
-int main() 
-{
-    std::cout << "Testing GGML matrix loading..." << std::endl;
-    
-    // 2D test files
-    const char* test_2d_a = "matrix_shards/test_2d_a.bin";
-    const char* test_2d_b = "matrix_shards/test_2d_b.bin";
-    
-    // 3D test files
-    const char* test_3d_a = "matrix_shards/test_3d_a.bin";
-    const char* test_3d_b = "matrix_shards/test_3d_b.bin";
-    
-    // 4D test files
-    const char* test_4d_a = "matrix_shards/test_4d_a.bin";
-    const char* test_4d_b = "matrix_shards/test_4d_b.bin";
-    
-    llama_matrix_backend server;
-    
-    // =========================================================================
-    // 2D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "2D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_2d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_2d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 2D matrices" << std::endl;
-        } else {
-            // Transpose B for GGML convention
-            auto matrix_B_T = server.transpose_2d(matrix_B.get(), rows_B, cols_B);
-            int rows_B_T = cols_B;
-            int cols_B_T = rows_B;
-            
-            std::cout << "Original A: " << rows_A << "x" << cols_A << std::endl;
-            std::cout << "Original B: " << rows_B << "x" << cols_B << std::endl;
-            std::cout << "Transposed B: " << rows_B_T << "x" << cols_B_T << std::endl;
-            
-            int dims2d_a[4] = {cols_A, rows_A, 1, 1};
-            int dims2d_b_T[4] = {rows_B, cols_B, 1, 1};
-            
-            std::cout << "\nMatrix A:" << std::endl;
-            server.print_matrix(matrix_A.get(), dims2d_a, 20);
-            std::cout << "Matrix B (transposed):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims2d_b_T, 15);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims2d_a, 
-                matrix_B_T.get(), dims2d_b_T, 
-                server.ggml_backends[0], "mul"
-            );
-            
-            std::cout << "2D Result (A @ B):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, 12);
-        }
-    }
-    
-    // =========================================================================
-    // 3D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "3D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_3d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_3d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 3D matrices" << std::endl;
-        } else {
-            std::cout << "Original A: batch=" << batchA << ", rows=" << rows_A << ", cols=" << cols_A << std::endl;
-            std::cout << "Original B: batch=" << batchB << ", rows=" << rows_B << ", cols=" << cols_B << std::endl;
-            
-            // Transpose each batch in B for GGML convention
-            auto matrix_B_T = server.transpose_3d(matrix_B.get(), batchB, rows_B, cols_B);
-            
-            // For GGML: dims = [cols, rows, 1, batch]
-            int dims3d_a[4] = {cols_A, rows_A, 1, batchA};
-            int dims3d_b_T[4] = {rows_B, cols_B, 1, batchB};  // B is transposed
-            
-            std::cout << "\nMatrix A (first batch):" << std::endl;
-            server.print_matrix(matrix_A.get(), dims3d_a, 6);
-            std::cout << "Matrix B transposed (first batch):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims3d_b_T, 6);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims3d_a, 
-                matrix_B_T.get(), dims3d_b_T, 
-                server.ggml_backends[0], "mul"
-            );
-            
-            std::cout << "3D Result (batch matmul):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, std::min(12, result.dims[0]*result.dims[1]*result.dims[2]*result.dims[3]));
-        }
-    }
-    
-    // =========================================================================
-    // 4D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "4D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_4d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_4d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 4D matrices" << std::endl;
-        } else {
-            std::cout << "Original A: batch=" << batchA << ", depth=" << depthA 
-                      << ", rows=" << rows_A << ", cols=" << cols_A << std::endl;
-            std::cout << "Original B: batch=" << batchB << ", depth=" << depthB 
-                      << ", rows=" << rows_B << ", cols=" << cols_B << std::endl;
-            
-            // Transpose each 2D slice in B for GGML convention
-            auto matrix_B_T = server.transpose_4d(matrix_B.get(), batchB, depthB, rows_B, cols_B);
-            
-            // For GGML: dims = [cols, rows, depth, batch]
-            int dims4d_a[4] = {cols_A, rows_A, depthA, batchA};
-            int dims4d_b_T[4] = {rows_B, cols_B, depthB, batchB};  // B is transposed
-            
-            std::cout << "\nMatrix A (first batch, first depth):" << std::endl;
-            server.print_matrix(matrix_A.get(), dims4d_a, 4);
-            std::cout << "Matrix B transposed (first batch, first depth):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims4d_b_T, 4);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims4d_a, 
-                matrix_B_T.get(), dims4d_b_T, 
-                server.ggml_backends[2], "mul"
-            );
-            
-            std::cout << "4D Result (batch of batch matmul):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, std::min(8, result.dims[0]*result.dims[1]*result.dims[2]*result.dims[3]));
-        }
-    }
-    
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "ALL TESTS COMPLETED" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    return 0;
-}
-*/

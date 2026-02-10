@@ -33,10 +33,10 @@ if __name__ == "__main__":
 
     #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
     
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
-    percentages = [0.35,0.35,0.15,0.15]  
-    backend_select_list = ['llama','llama','llama','llama']
-    CPU_GPU_select_list = [ True, True, True, False ]   
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101']   
+    percentages = [0.45,0.4,0.15]  
+    backend_select_list = ['llama','llama','llama']
+    CPU_GPU_select_list = [ True, True, True]   
     '''
     you normally dont need to do this but in my case the last node is only CPU
     blas only(no GPU at all) and will fail on CPU 'add' so i need to disable the back-end setting 

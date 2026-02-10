@@ -19,8 +19,11 @@ read -p "Enter choice [1 or 2]: " INSTALL_TYPE
 # Path to install scripts
 INSTALL_DIR="$(dirname "$0")/install"
 
+PROJECT_ROOT="$(pwd)"
+
 PY_ENV_SCRIPT="$INSTALL_DIR/install_py_env.sh"
 GGML_BACKEND_SCRIPT="$INSTALL_DIR/build_ggml_backend.sh"
+LIBTORCH_SCRIPT="$INSTALL_DIR/install_libtorch.sh"
 
 # Validate scripts exist
 if [[ ! -f "$GGML_BACKEND_SCRIPT" ]]; then

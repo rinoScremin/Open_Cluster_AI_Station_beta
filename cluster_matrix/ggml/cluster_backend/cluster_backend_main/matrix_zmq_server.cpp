@@ -30,51 +30,9 @@
 #include <cctype>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <limits>
 
-
-struct combined_matrix_shards
-{
-    struct ShardView {
-        int rows = 0;
-        int cols = 0;
-        std::unique_ptr<float[]> data;
-    };
-
-    int total_shards_reserved = 0;   // Number of unique shards currently received
-    int number_of_shards_needed = 0; // Total shards expected for this matrix (0 until learned)
-    std::string file_name;           // Base filename (without shard index)
-
-    // Shards keyed by shard index (float32 payload).
-    std::unordered_map<int, ShardView> shards;
-
-    // Track index range to avoid sorting in combine when indices are contiguous.
-    int min_shard_index = 0;
-    int max_shard_index = -1;
-    bool have_index_range = false;
-
-    // System marker:
-    // - System 1: concatenate shards along join_dim
-    // - System 2: 2D grid tile assembly
-    bool is_system2 = false;
-
-    // Output dtype tag for the final combined matrix (v2 header):
-    //   -1 = float32, -2 = float16, -3 = bfloat16
-    int output_dtype_tag = -1;
-
-    int join_dim = 0; // 0 = rows, 1 = cols (for 2D outputs)
-};
-
-struct matrix_shard_object
-{
-    std::string base_file_name;
-    int rows_A = 0;
-    int cols_A = 0;
-    int batchA = 1;
-    int depthA = 1;
-    std::shared_ptr<std::vector<float>> data;
-    int output_dtype_tag = -1; // -1 float32, -2 float16, -3 bfloat16
-};
 
 static inline float bf16_to_f32(uint16_t v) {
     uint32_t bits = uint32_t(v) << 16;
@@ -297,11 +255,16 @@ class llama_zmq_server
         std::map<std::string, std::vector<std::pair<int, std::vector<uint8_t>>>> pending_shards;  
         std::map<std::string, std::set<int>> received_shards;  
         std::mutex shared_memory_mutex;
-        // Fallback shard counters for outputs when inputs have no shard suffix
-        std::map<std::string, int> output_shard_counters;
-        std::mutex output_shard_mutex;
+	        // Fallback shard counters for outputs when inputs have no shard suffix
+	        std::map<std::string, int> output_shard_counters;
+	        std::mutex output_shard_mutex;
 
-    private:
+	        // Track matrices that require FlashAttention-specific combine behavior.
+	        // Keyed by the base matrix name used by `handle_combine_matrix_shard_list` (no `_shard_N.bin`).
+	        std::unordered_set<std::string> flash_atten_openartion_combine_list;
+	        std::mutex flash_atten_openartion_combine_mutex;
+
+	    private:
         static std::string normalize_matrix_key(const std::string& path_or_name) {
             return std::filesystem::path(path_or_name).filename().string();
         }
@@ -1379,6 +1342,586 @@ class llama_zmq_server
                 }
 
                 // ----------------------------
+                // Transformer Computation Operations
+                // ----------------------------
+                if (command_type == "transformerOp")
+                {
+                    if (command_args.size() < 9) {
+                        std::cerr << "❌ Insufficient parameters for transformerOp "
+                                << "(expected 9, got " << command_args.size() << ")"
+                                << std::endl;
+                        return -3;
+                    }
+
+                    // transformerOp <matrix>
+                    //               <transposeA>
+                    //               <use_gpu>
+                    //               <gpu_id>
+                    //               <send_back>
+                    //               <operation_type>
+                    //               <n_dims>
+                    //               <shard_index_override>
+
+                    const std::string& matrix_name = command_args[1];
+                    bool transposeA = (command_args[2] == "true");
+                    bool use_gpu    = (command_args[3] == "true");
+                    int gpu_id      = std::stoi(command_args[4]);
+                    int send_back   = std::stoi(command_args[5]);
+                    std::string operation_type = command_args[6];
+                    int n_dims      = std::stoi(command_args[7]);
+                    int shard_index_override = std::stoi(command_args[8]);
+
+                    std::cout << "**run_server_command** transformerOp\n"
+                            << "  matrix: " << matrix_name << "\n"
+                            << "  op: " << operation_type << "\n"
+                            << "  gpu: " << use_gpu << " (id " << gpu_id << ")\n"
+                            << "  send_back: " << send_back << "\n"
+                            << "  shard_override: " << shard_index_override
+                            << std::endl;
+
+                    matrix_shard_object matrixA_obj;
+                    if (!try_get_matrix_shard_object(matrix_name, matrixA_obj)) {
+                        std::cerr << "❌ Missing input matrix in matrix_shard_object_list"
+                                << std::endl;
+                        std::cerr << "   Needed: '" << matrix_name << "'" << std::endl;
+                        return -8;
+                    }
+
+                    const bool operation_success = transformer_operation(
+                        "llama",               // ✅ backend selection
+                        matrixA_obj,
+                        transposeA,
+                        use_gpu,
+                        gpu_id,
+                        send_back,
+                        operation_type,
+                        n_dims,
+                        shard_index_override
+                    );
+
+                    if (operation_success) {
+                        std::cout << "✅ Transformer operation completed successfully"
+                                << std::endl;
+                        return 0;
+                    } else {
+                        std::cerr << "❌ Transformer operation failed: "
+                                << operation_type << std::endl;
+                        return -7;
+                    }
+                }
+
+                // ----------------------------
+                // rope Computation Operations
+                // ----------------------------
+                if (command_type == "rope")
+                {
+                    // ----------------------------
+                    // Parse command_args
+                    // ----------------------------
+                    const std::string& matrix_name = command_args[1];
+                    bool transposeA = (command_args[2] == "true");
+                    bool use_gpu    = (command_args[3] == "true");
+                    int gpu_id      = std::stoi(command_args[4]);
+                    int send_back   = std::stoi(command_args[5]);
+                    std::string operation_type = command_args[6];
+                    int rope_type   = std::stoi(command_args[7]);
+                    int shard_index_override = std::stoi(command_args[8]);
+
+                    // Parse extra parameters from Python side
+                    std::vector<float> extra_params;
+                    std::stringstream ss(command_args[9]);
+                    std::string token;
+                    while (std::getline(ss, token, ',')) {
+                        extra_params.push_back(std::stof(token));
+                    }
+
+                    std::cout << "**run_server_command** rope\n"
+                            << "  matrix: " << matrix_name << "\n"
+                            << "  transpose: " << transposeA << "\n"
+                            << "  gpu: " << use_gpu << " (id " << gpu_id << ")\n"
+                            << "  send_back: " << send_back << "\n"
+                            << "  op: " << operation_type << "\n"
+                            << "  rope_type: " << rope_type << "\n"
+                            << "  shard_override: " << shard_index_override
+                            << std::endl;
+
+                    // ----------------------------
+                    // Fetch matrix shard object
+                    // ----------------------------
+                    matrix_shard_object matrixA_obj;
+                    if (!try_get_matrix_shard_object(matrix_name, matrixA_obj)) {
+                        std::cerr << "❌ Missing input matrix in matrix_shard_object_list\n"
+                                << "   Needed: '" << matrix_name << "'"
+                                << std::endl;
+                        return -8;
+                    }
+
+                    // ----------------------------
+                    // Construct RoPE structs
+                    // ----------------------------
+                    RoPEParams      base_params{};
+                    RoPEExtParams   ext_params{};
+                    RoPEMultiParams multi_params{};
+
+                    RoPEParams*      base_ptr  = nullptr;
+                    RoPEExtParams*   ext_ptr   = nullptr;
+                    RoPEMultiParams* multi_ptr = nullptr;
+
+                    if (rope_type == 0) {
+                        base_params.pos_data = (extra_params.size() > 0)
+                            ? reinterpret_cast<int32_t*>(static_cast<intptr_t>(extra_params[0]))
+                            : nullptr;
+                        for (int i = 0; i < 4 && extra_params.size() > i+1; ++i)
+                            base_params.pos_dims[i] = static_cast<int>(extra_params[1 + i]);
+                        base_params.n_dims = (extra_params.size() > 5) ? static_cast<int>(extra_params[5]) : 0;
+                        base_params.mode   = (extra_params.size() > 6) ? static_cast<int>(extra_params[6]) : 0;
+                        base_ptr = &base_params;
+                    }
+                    else if (rope_type == 1) {
+                        ext_params.pos_data          = (extra_params.size() > 0) ? reinterpret_cast<int32_t*>(static_cast<intptr_t>(extra_params[0])) : nullptr;
+                        ext_params.freq_factors_data = (extra_params.size() > 1) ? reinterpret_cast<float*>(static_cast<intptr_t>(extra_params[1])) : nullptr;
+                        for (int i = 0; i < 4 && extra_params.size() > i+2; ++i) {
+                            ext_params.pos_dims[i]  = static_cast<int>(extra_params[2 + i]);
+                            ext_params.freq_dims[i] = (extra_params.size() > 6+i) ? static_cast<int>(extra_params[6 + i]) : 0;
+                        }
+                        ext_params.n_dims      = (extra_params.size() > 10) ? static_cast<int>(extra_params[10]) : 0;
+                        ext_params.mode        = (extra_params.size() > 11) ? static_cast<int>(extra_params[11]) : 0;
+                        ext_params.n_ctx_orig  = (extra_params.size() > 12) ? static_cast<int>(extra_params[12]) : 0;
+                        ext_params.freq_base   = (extra_params.size() > 13) ? extra_params[13] : 0.0f;
+                        ext_params.freq_scale  = (extra_params.size() > 14) ? extra_params[14] : 0.0f;
+                        ext_params.ext_factor  = (extra_params.size() > 15) ? extra_params[15] : 0.0f;
+                        ext_params.attn_factor = (extra_params.size() > 16) ? extra_params[16] : 0.0f;
+                        ext_params.beta_fast   = (extra_params.size() > 17) ? extra_params[17] : 0.0f;
+                        ext_params.beta_slow   = (extra_params.size() > 18) ? extra_params[18] : 0.0f;
+                        ext_ptr = &ext_params;
+                    }
+                    else if (rope_type == 2) {
+                        multi_params.pos_data          = (extra_params.size() > 0) ? reinterpret_cast<int32_t*>(static_cast<intptr_t>(extra_params[0])) : nullptr;
+                        multi_params.freq_factors_data = (extra_params.size() > 1) ? reinterpret_cast<float*>(static_cast<intptr_t>(extra_params[1])) : nullptr;
+                        for (int i = 0; i < 4; ++i) {
+                            multi_params.pos_dims[i]  = (extra_params.size() > i+2) ? static_cast<int>(extra_params[2 + i]) : 0;
+                            multi_params.freq_dims[i] = (extra_params.size() > i+6) ? static_cast<int>(extra_params[6 + i]) : 0;
+                            multi_params.sections[i]  = (extra_params.size() > i+10) ? static_cast<int>(extra_params[10 + i]) : 0;
+                        }
+                        multi_params.n_dims      = (extra_params.size() > 14) ? static_cast<int>(extra_params[14]) : 0;
+                        multi_params.mode        = (extra_params.size() > 15) ? static_cast<int>(extra_params[15]) : 0;
+                        multi_params.n_ctx_orig  = (extra_params.size() > 16) ? static_cast<int>(extra_params[16]) : 0;
+                        multi_params.freq_base   = (extra_params.size() > 17) ? extra_params[17] : 0.0f;
+                        multi_params.freq_scale  = (extra_params.size() > 18) ? extra_params[18] : 0.0f;
+                        multi_params.ext_factor  = (extra_params.size() > 19) ? extra_params[19] : 0.0f;
+                        multi_params.attn_factor = (extra_params.size() > 20) ? extra_params[20] : 0.0f;
+                        multi_params.beta_fast   = (extra_params.size() > 21) ? extra_params[21] : 0.0f;
+                        multi_params.beta_slow   = (extra_params.size() > 22) ? extra_params[22] : 0.0f;
+                        multi_ptr = &multi_params;
+                    }
+                    else {
+                        std::cerr << "❌ Invalid rope_type: " << rope_type << std::endl;
+                        return -3;
+                    }
+
+                    // ----------------------------
+                    // Execute RoPE operation
+                    // ----------------------------
+                    bool success = rope_openartion(
+                        "llama",
+                        matrixA_obj,
+                        transposeA,
+                        use_gpu,
+                        gpu_id,
+                        send_back,
+                        operation_type,
+                        base_ptr,
+                        ext_ptr,
+                        multi_ptr,
+                        shard_index_override
+                    );
+
+                    if (success) {
+                        std::cout << "✅ RoPE operation completed successfully" << std::endl;
+                        return 0;
+                    } else {
+                        std::cerr << "❌ RoPE operation failed" << std::endl;
+                        return -7;
+                    }
+                }
+
+                // ----------------------------
+                // flash_attn Computation Operation
+                // ----------------------------
+                if (command_type == "flash_attn") 
+                {
+                    // Expected command structure:
+                    // flash_attn <matrixQ> <TransposeQ> <matrixK> <TransposeK> <matrixV> <TransposeV> 
+                    //            <use_gpu> <gpu_id> <send_back> <operation_type> <scale?> <max_bias?> <logit_softcap?> <backend=?> <mask=?> <shard_index?>
+
+                    if (command_args.size() < 11) {
+                        std::cerr << "❌ Insufficient parameters for flash_attn "
+                                << "(expected at least 11, got " << command_args.size() << ")"
+                                << std::endl;
+                        return -3;
+                    }
+
+                    const std::string& matrixQ_name = command_args[1];
+                    bool transposeQ = (command_args[2] == "true");
+                    const std::string& matrixK_name = command_args[3];
+                    bool transposeK = (command_args[4] == "true");
+                    const std::string& matrixV_name = command_args[5];
+                    bool transposeV = (command_args[6] == "true");
+
+                    bool use_gpu = (command_args[7] == "true");
+                    int gpu_id = std::stoi(command_args[8]);
+                    int send_back = std::stoi(command_args[9]);
+                    std::string operation_type = command_args[10];
+
+                    // Optional extras: scale/max_bias/logit_softcap, optional mask=..., last token is shard_index (if present).
+                    float scale = 0.0f;
+                    float max_bias = 0.0f;
+                    float logit_softcap = 0.0f;
+                    int shard_index_override = -1;
+                    std::string mask_name;
+                    std::string backend_type = "llama";
+
+                    auto is_number = [](const std::string& s) -> bool {
+                        if (s.empty()) return false;
+                        char* end = nullptr;
+                        std::strtod(s.c_str(), &end);
+                        return end != s.c_str() && *end == '\0';
+                    };
+
+                    if ((int)command_args.size() > 11) {
+                        int last_idx = (int)command_args.size() - 1;
+                        if (is_number(command_args[last_idx])) {
+                            shard_index_override = std::stoi(command_args[last_idx]);
+                            last_idx -= 1;
+                        }
+
+                        int numeric_seen = 0;
+                        for (int i = 11; i <= last_idx; ++i) {
+                            const std::string& tok = command_args[i];
+                            if (tok.rfind("mask=", 0) == 0) {
+                                mask_name = tok.substr(5);
+                                continue;
+                            }
+                            if (tok.rfind("backend=", 0) == 0) {
+                                backend_type = tok.substr(8);
+                                continue;
+                            }
+                            if (is_number(tok)) {
+                                if (numeric_seen == 0) scale = std::stof(tok);
+                                else if (numeric_seen == 1) max_bias = std::stof(tok);
+                                else if (numeric_seen == 2) logit_softcap = std::stof(tok);
+                                numeric_seen++;
+                                continue;
+                            }
+                            if (mask_name.empty()) {
+                                mask_name = tok;
+                            }
+                        }
+                    }
+
+                    std::cout << "**run_server_command** flash_attn\n"
+                            << "  Q: " << matrixQ_name << " transpose=" << transposeQ << "\n"
+                            << "  K: " << matrixK_name << " transpose=" << transposeK << "\n"
+                            << "  V: " << matrixV_name << " transpose=" << transposeV << "\n"
+                            << "  GPU: " << (use_gpu ? "Yes (ID: " + std::to_string(gpu_id) + ")" : "No") << "\n"
+                            << "  send_back: " << send_back << "\n"
+                            << "  operation: " << operation_type << "\n"
+                            << "  scale: " << scale << " max_bias: " << max_bias << " logit_softcap: " << logit_softcap << "\n"
+                            << "  backend: " << backend_type << "\n"
+                            << "  shard_override: " << shard_index_override << "\n"
+                            << "  mask: " << (mask_name.empty() ? "none" : mask_name) << std::endl;
+
+                    if (backend_type != "llama" && backend_type != "torch") {
+                        std::cerr << "❌ Unsupported flash_attn backend: " << backend_type << std::endl;
+                        return -3;
+                    }
+
+                    // Fetch matrix shard objects
+                    matrix_shard_object matrixQ, matrixK, matrixV;
+                    matrix_shard_object matrixMask;
+                    if (!try_get_matrix_shard_object(matrixQ_name, matrixQ) ||
+                        !try_get_matrix_shard_object(matrixK_name, matrixK) ||
+                        !try_get_matrix_shard_object(matrixV_name, matrixV)) 
+                    {
+                        std::cerr << "❌ Missing one or more input matrices in matrix_shard_object_list" << std::endl;
+                        return -8;
+                    }
+                    bool has_mask = false;
+                    if (!mask_name.empty()) {
+                        if (!try_get_matrix_shard_object(mask_name, matrixMask)) {
+                            std::cerr << "❌ Mask matrix not found: " << mask_name << std::endl;
+                            return -8;
+                        }
+                        has_mask = true;
+                    }
+
+                    // Call the flash_attn operation
+                    bool success = flash_atten_openartion(
+                        backend_type,     // backend_type
+                        matrixQ, transposeQ,
+                        matrixK, transposeK,
+                        matrixV, transposeV,
+                        has_mask ? &matrixMask : nullptr,
+                        scale,
+                        max_bias,
+                        logit_softcap,
+                        use_gpu,
+                        gpu_id,
+                        send_back,
+                        operation_type,
+                        shard_index_override
+                    );
+
+                    if (success) {
+                        std::cout << "✅ flash_attn operation completed successfully" << std::endl;
+                        return 0;
+                    } else {
+                        std::cerr << "❌ flash_attn operation failed" << std::endl;
+                        return -7;
+                    }
+                }
+
+                // ----------------------------  
+                // Reshape Computation Operation  
+                // ----------------------------  
+                if (command_type == "reshape")  
+                {  
+                    // Expected command structure:  
+                    // reshape <matrix> <transpose> <use_gpu> <gpu_id> <send_back> <output_dims> <shard_index>  
+                
+                    if (command_args.size() < 8) {  
+                        std::cerr << "❌ Insufficient parameters for reshape "  
+                                << "(expected at least 8, got " << command_args.size() << ")"  
+                                << std::endl;  
+                        return -3;  
+                    }  
+                
+                    // Parse command arguments  
+                    const std::string& matrix_name = command_args[1];  
+                    bool transposeA = (command_args[2] == "true");  
+                    bool use_gpu = (command_args[3] == "true");  
+                    int gpu_id = std::stoi(command_args[4]);  
+                    int send_back = std::stoi(command_args[5]);  
+                    
+                    // Parse output dimensions from comma-separated string  
+                    std::vector<int> output_dims;  
+                    std::stringstream ss_dims(command_args[6]);  
+                    std::string dim_token;  
+                    while (std::getline(ss_dims, dim_token, ',')) {  
+                        output_dims.push_back(std::stoi(dim_token));  
+                    }  
+                    
+                    if (output_dims.size() != 4) {  
+                        std::cerr << "❌ Invalid output dimensions: expected 4 values, got " << output_dims.size() << std::endl;  
+                        return -3;  
+                    }  
+                    
+                    int shard_index_override = std::stoi(command_args[7]);  
+                
+                    std::cout << "**run_server_command** reshape\n"  
+                            << "  matrix: " << matrix_name << "\n"  
+                            << "  transpose: " << transposeA << "\n"  
+                            << "  gpu: " << use_gpu << " (id " << gpu_id << ")\n"  
+                            << "  send_back: " << send_back << "\n"  
+                            << "  output_dims: [" << output_dims[0] << ", " << output_dims[1]   
+                            << ", " << output_dims[2] << ", " << output_dims[3] << "]\n"  
+                            << "  shard_override: " << shard_index_override << std::endl;  
+                
+                    // Fetch matrix shard object  
+                    matrix_shard_object matrixA_obj;  
+                    if (!try_get_matrix_shard_object(matrix_name, matrixA_obj)) {  
+                        std::cerr << "❌ Missing input matrix in matrix_shard_object_list\n"  
+                                << "   Needed: '" << matrix_name << "'" << std::endl;  
+                        return -8;  
+                    }  
+                
+                    // Execute reshape operation  
+                    bool success = reshape_matrix(  
+                        "llama",               // backend_type  
+                        matrixA_obj,  
+                        transposeA,  
+                        use_gpu,  
+                        gpu_id,  
+                        send_back,  
+                        output_dims.data(),    // output_dims[4]  
+                        shard_index_override  
+                    );  
+                
+                    if (success) {  
+                        std::cout << "✅ Reshape operation completed successfully" << std::endl;  
+                        return 0;  
+                    } else {  
+                        std::cerr << "❌ Reshape operation failed" << std::endl;  
+                        return -7;  
+                    }  
+                }
+
+                // ----------------------------  
+                // Repeat Computation Operation  
+                // ----------------------------  
+                if (command_type == "repeat")  
+                {  
+                    // Expected command structure:  
+                    // repeat <matrix> <transpose> <use_gpu> <gpu_id> <send_back> <repeat_dims> <shard_index>  
+                
+                    if (command_args.size() < 8) {  
+                        std::cerr << "❌ Insufficient parameters for repeat "  
+                                << "(expected at least 8, got " << command_args.size() << ")"  
+                                << std::endl;  
+                        return -3;  
+                    }  
+                
+                    // Parse command arguments  
+                    const std::string& matrix_name = command_args[1];  
+                    bool transposeA = (command_args[2] == "true");  
+                    bool use_gpu = (command_args[3] == "true");  
+                    int gpu_id = std::stoi(command_args[4]);  
+                    int send_back = std::stoi(command_args[5]);  
+                    
+                    // Parse repeat dimensions from comma-separated string  
+                    std::vector<int> repeat_dims;  
+                    std::stringstream ss_dims(command_args[6]);  
+                    std::string dim_token;  
+                    while (std::getline(ss_dims, dim_token, ',')) {  
+                        repeat_dims.push_back(std::stoi(dim_token));  
+                    }  
+                    
+                    if (repeat_dims.size() != 4) {  
+                        std::cerr << "❌ Invalid repeat dimensions: expected 4 values, got " << repeat_dims.size() << std::endl;  
+                        return -3;  
+                    }  
+                    
+                    int shard_index_override = std::stoi(command_args[7]);  
+                
+                    std::cout << "**run_server_command** repeat\n"  
+                            << "  matrix: " << matrix_name << "\n"  
+                            << "  transpose: " << transposeA << "\n"  
+                            << "  gpu: " << use_gpu << " (id " << gpu_id << ")\n"  
+                            << "  send_back: " << send_back << "\n"  
+                            << "  repeat_dims: [" << repeat_dims[0] << ", " << repeat_dims[1]  
+                            << ", " << repeat_dims[2] << ", " << repeat_dims[3] << "]\n"  
+                            << "  shard_override: " << shard_index_override << std::endl;  
+                
+                    // Fetch matrix shard object  
+                    matrix_shard_object matrixA_obj;  
+                    if (!try_get_matrix_shard_object(matrix_name, matrixA_obj)) {  
+                        std::cerr << "❌ Missing input matrix in matrix_shard_object_list\n"  
+                                << "   Needed: '" << matrix_name << "'" << std::endl;  
+                        return -8;  
+                    }  
+                
+                    // Execute repeat operation  
+                    bool success = repeat_matrix(  
+                        "llama",               // backend_type  
+                        matrixA_obj,  
+                        transposeA,  
+                        use_gpu,  
+                        gpu_id,  
+                        send_back,  
+                        repeat_dims.data(),    // repeat_dims[4]  
+                        shard_index_override  
+                    );  
+                
+                    if (success) {  
+                        std::cout << "✅ Repeat operation completed successfully" << std::endl;  
+                        return 0;  
+                    } else {  
+                        std::cerr << "❌ Repeat operation failed" << std::endl;  
+                        return -7;  
+                    }  
+                }
+
+
+                // ----------------------------
+                // combine and send back shards
+                // ----------------------------
+                if (command_type == "send_back")
+                {
+                    // Expected command: send_back <matrix_name> <shard_index> <send_back>
+                    if (command_args.size() < 4) {
+                        std::cerr << "❌ Insufficient parameters for send_back "
+                                << "(expected 4, got " << command_args.size() << ")" << std::endl;
+                        try { send_ack("ACK_send_back_complete"); } catch (...) {}
+                        return -3;
+                    }
+
+                    const std::string& matrix_name = command_args[1];
+                    int shard_index = std::stoi(command_args[2]);
+                    int send_back = std::stoi(command_args[3]);  // can be encoded join_dim/system
+
+                    // Build shard filename if base name was provided
+                    std::string shard_name = matrix_name;
+                    if (shard_name.find("_shard_") == std::string::npos) {
+                        shard_name += "_shard_" + std::to_string(shard_index) + ".bin";
+                    }
+
+                    std::cout << "**run_server_command** send_back\n"
+                            << "  matrix: " << matrix_name << "\n"
+                            << "  shard_index: " << shard_index << "\n"
+                            << "  send_back: " << send_back << "\n"
+                            << "  shard_name: " << shard_name << std::endl;
+
+                    // Look up the shard
+                    matrix_shard_object matrix_obj;
+                    if (!try_get_matrix_shard_object(shard_name, matrix_obj)) {
+                        std::cerr << "❌ Missing matrix in matrix_shard_object_list\n"
+                                << "   Needed: '" << shard_name << "'" << std::endl;
+                        try { send_ack("ACK_send_back_complete"); } catch (...) {}
+                        return -8;
+                    }
+
+                    if (!matrix_obj.data) {
+                        std::cerr << "❌ Matrix has no data: " << shard_name << std::endl;
+                        try { send_ack("ACK_send_back_complete"); } catch (...) {}
+                        return -9;
+                    }
+
+                    // Convert shard to MatrixResult
+                    MatrixResult result;
+                    result.dims[0] = std::max(1, matrix_obj.batchA);
+                    result.dims[1] = std::max(1, matrix_obj.depthA);
+                    result.dims[2] = std::max(1, matrix_obj.rows_A);
+                    result.dims[3] = std::max(1, matrix_obj.cols_A);
+
+                    const size_t total_elements =
+                        static_cast<size_t>(result.dims[0]) *
+                        static_cast<size_t>(result.dims[1]) *
+                        static_cast<size_t>(result.dims[2]) *
+                        static_cast<size_t>(result.dims[3]);
+
+                    if (matrix_obj.data->size() != total_elements) {
+                        std::cerr << "❌ Matrix size mismatch for " << shard_name
+                                << " (expected " << total_elements
+                                << ", got " << matrix_obj.data->size() << ")" << std::endl;
+                        try { send_ack("ACK_send_back_complete"); } catch (...) {}
+                        return -9;
+                    }
+
+                    result.data = std::make_unique<float[]>(total_elements);
+                    std::memcpy(result.data.get(), matrix_obj.data->data(), total_elements * sizeof(float));
+
+                    // Send back this shard to the head node
+                    bool success = send_back_file(
+                        shard_name,                 // local_file_path
+                        shard_name,                 // filename
+                        result,                     // MatrixResult
+                        send_back,                  // encoded send_back flag
+                        "llama",                    // backend (adjust if needed)
+                        matrix_obj.output_dtype_tag // dtype tag
+                    );
+
+                    if (success) {
+                        std::cout << "✅ Shard " << shard_index << " sent back successfully" << std::endl;
+                    } else {
+                        std::cerr << "❌ Failed to send back shard " << shard_index << std::endl;
+                    }
+
+                    try { send_ack("ACK_send_back_complete"); } catch (...) {}
+                    return success ? 0 : -7;
+                }
+    
+
+                // ----------------------------
                 // Matrix Computation Operations
                 // ----------------------------
                 if (command_type == "llama" || command_type == "opencl" || command_type == "torch") 
@@ -1420,7 +1963,6 @@ class llama_zmq_server
                             std::cerr << "   Needed: '" << command_args[3] << "' and '" << command_args[1] << "'" << std::endl;
                             return -8;
                         }
-
                         operation_success = matrix_operation(
                             command_type,
                             matrixA_obj,               // Matrix B (GGML order)
@@ -1697,20 +2239,22 @@ class llama_zmq_server
 	                        std::cerr << "ERROR: Failed to decode sent_back payload: " << actual_filename << std::endl;
 	                        return;
 	                    }
-	                    if (batch != 1 || depth != 1) {
-	                        std::cerr << "ERROR: sent_back combine currently expects 2D (batch=1, depth=1) but got "
-	                                  << batch << "," << depth << " for " << actual_filename << std::endl;
-	                        return;
-	                    }
+		                    if (batch != 1 || depth != 1) {
+		                        std::cout << "INFO: sent_back payload is 4D (batch=" << batch
+		                                  << ", depth=" << depth << "); combine will flatten to 2D for "
+		                                  << actual_filename << std::endl;
+		                    }
 
-	                    handle_combine_matrix_shard_list(
-	                        actual_filename,
-	                        std::move(shard_data),
-	                        rows,
-	                        cols,
-	                        send_back,
-	                        dtype_tag
-	                    );
+		                    handle_combine_matrix_shard_list(
+		                        actual_filename,
+		                        std::move(shard_data),
+		                        rows,
+		                        cols,
+		                        batch,
+		                        depth,
+		                        send_back,
+		                        dtype_tag
+		                    );
 
 	                    return;
 	                }
@@ -1795,7 +2339,7 @@ class llama_zmq_server
             std::cout << "Save file handler completed" << std::endl;
         }
 
-	        bool send_back_file(const std::string& local_file_path,
+	    bool send_back_file(const std::string& local_file_path,
 	                            const std::string& filename,
 	                            MatrixResult& save_result,
 	                            int total_shards,
@@ -1855,12 +2399,14 @@ class llama_zmq_server
             // ============================================================
             // HEAD NODE → SAVE FILE + TRACK SHARDS
             // ============================================================
-	            if (is_head_node)
-	            {
-	                // Extract shard dimensions
-	                int shard_rows = save_result.dims[2];
-	                int shard_cols = save_result.dims[3];
-	                const size_t data_size = static_cast<size_t>(shard_rows) * static_cast<size_t>(shard_cols) * sizeof(float);
+		            if (is_head_node)
+		            {
+		                // Extract shard dimensions
+		                const int shard_batch = save_result.dims[0];
+		                const int shard_depth = save_result.dims[1];
+		                int shard_rows = save_result.dims[2];
+		                int shard_cols = save_result.dims[3];
+		                const size_t data_size = static_cast<size_t>(shard_rows) * static_cast<size_t>(shard_cols) * sizeof(float);
 
 	                // Move shard buffer directly into combine path (avoid extra copy).
 	                auto shard_data = std::move(save_result.data);
@@ -1870,16 +2416,18 @@ class llama_zmq_server
 	                }
 
 
-	                std::cout << "**send_back_file** total_shards: " << total_shards;
-	                // Process shard through combination handler
-	                bool result = handle_combine_matrix_shard_list(
-                    filename,
-                    std::move(shard_data),
-                    shard_rows,
-                    shard_cols,
-                    total_shards,
-                    output_dtype_tag
-                );
+		                std::cout << "**send_back_file** total_shards: " << total_shards;
+		                // Process shard through combination handler
+		                bool result = handle_combine_matrix_shard_list(
+	                    filename,
+	                    std::move(shard_data),
+	                    shard_rows,
+	                    shard_cols,
+	                    shard_batch,
+	                    shard_depth,
+	                    total_shards,
+	                    output_dtype_tag
+	                );
 
                 std::cout << "Head node processed shard: " << filename 
                         << " (" << data_size << " bytes)" << std::endl;
@@ -1973,15 +2521,17 @@ class llama_zmq_server
             return true;
         }
 
-        bool handle_combine_matrix_shard_list(
-            const std::string& filename,
-            std::unique_ptr<float[]> data,
-            int shard_rows,
-            int shard_cols,
-            int total_shards,
-            int output_dtype_tag
-        )
-        {
+	    bool handle_combine_matrix_shard_list(
+	        const std::string& filename,
+	        std::unique_ptr<float[]> data,
+	        int shard_rows,
+	        int shard_cols,
+	        int shard_batch,
+	        int shard_depth,
+	        int total_shards,
+	        int output_dtype_tag
+	    )
+	    {
             // Optimized combine path:
             // - store float shards directly (no shard_bytes / Torch cat)
             // - combine via memcpy into one output buffer when complete
@@ -2037,11 +2587,14 @@ class llama_zmq_server
                     return true;
                 }
 
-                combined_matrix_shards::ShardView view;
-                view.rows = shard_rows;
-                view.cols = shard_cols;
-                view.data = std::move(data);
-                combined.shards.emplace(shard_num, std::move(view));
+	                combined_matrix_shards::ShardView view;
+	                view.batch = shard_batch;
+	                view.depth = shard_depth;
+	                view.rows = shard_rows;
+	                view.cols = shard_cols;
+	                view.dtype_tag = output_dtype_tag;
+	                view.data = std::move(data);
+	                combined.shards.emplace(shard_num, std::move(view));
                 combined.total_shards_reserved = static_cast<int>(combined.shards.size());
 
                 if (!combined.have_index_range) {
@@ -2062,45 +2615,87 @@ class llama_zmq_server
                 }
             }
 
-            if (!completed) {
-                return true;
-            }
+	            if (!completed) {
+	                return true;
+	            }
 
-            MatrixResult full;
-            if (done_needed == 1) {
-                if (done.shards.size() != 1) {
-                    std::cerr << "ERROR: Expected 1 shard but got "
-                              << done.shards.size() << " for " << matrix_name << std::endl;
-                    return true;
-                }
-                auto& only = done.shards.begin()->second;
-                full.dims[0] = 1;
-                full.dims[1] = 1;
-                full.dims[2] = only.rows;
-                full.dims[3] = only.cols;
-                full.data = std::move(only.data);
-            } else {
-                full = done.is_system2
-                    ? combine_matrix_shards_grid_2d(done)
-                    : combine_matrix_shards_2d(done);
-            }
+	            bool use_flash_combine = false;
+	            {
+	                std::lock_guard<std::mutex> lock(flash_atten_openartion_combine_mutex);
+	                use_flash_combine = (flash_atten_openartion_combine_list.find(matrix_name) != flash_atten_openartion_combine_list.end());
+	            }
+	            if (!use_flash_combine) {
+	                // Fallback: if the payload is 4D (batch/depth != 1), use the flattening combine.
+	                for (const auto& kv : done.shards) {
+	                    const auto& s = kv.second;
+	                    if (s.batch != 1 || s.depth != 1) {
+	                        use_flash_combine = true;
+	                        break;
+	                    }
+	                }
+	            }
 
-            if (full.data) {
-                const bool sent = send_combined_bin_to_python(
-                    matrix_name,
-                    full,
+	            MatrixResult full;
+	            try {
+	                if (done_needed == 1) {
+	                    if (done.shards.size() != 1) {
+	                        std::cerr << "ERROR: Expected 1 shard but got "
+	                                  << done.shards.size() << " for " << matrix_name << std::endl;
+	                        return true;
+	                    }
+	                    auto& only = done.shards.begin()->second;
+	                    const int64_t rows2d = (int64_t) only.batch * (int64_t) only.depth * (int64_t) only.rows;
+	                    if (rows2d <= 0 || rows2d > std::numeric_limits<int>::max()) {
+	                        throw std::runtime_error("Invalid flattened rows for single-shard combine");
+	                    }
+	                    full.dims[0] = 1;
+	                    full.dims[1] = 1;
+	                    full.dims[2] = (int) rows2d;
+	                    full.dims[3] = only.cols;
+	                    full.data = std::move(only.data);
+	                } else {
+	                    if (use_flash_combine) {
+	                        // For FlashAttention (and any 4D payloads), flatten (batch*depth*rows) to 2D before joining.
+                            full = done.is_system2
+	                            ? combine_flash_attn_shards_grid_2d(done)
+	                            : matrix_backend_llama.combine_flash_attn_shards_ggml(done);
+
+	                    } else {
+	                        full = done.is_system2
+	                            ? combine_matrix_shards_grid_2d(done)
+	                            : combine_matrix_shards_2d(done);
+	                    }
+	                }
+	            } catch (const std::exception& e) {
+	                std::cerr << "ERROR: Combine failed for " << matrix_name << ": " << e.what() << std::endl;
+	                // Avoid leaving stale flash-combine markers around.
+	                if (use_flash_combine) {
+	                    std::lock_guard<std::mutex> lock(flash_atten_openartion_combine_mutex);
+	                    flash_atten_openartion_combine_list.erase(matrix_name);
+	                }
+	                return true;
+	            }
+
+	            if (full.data) {
+	                const bool sent = send_combined_bin_to_python(
+	                    matrix_name,
+	                    full,
                     done_output_dtype_tag
                 );
                 if (!sent) {
                     std::cerr << "ERROR: Failed to stream combined PT for "
                               << matrix_name << std::endl;
-                }
-                send_ack("ACK_combined_matrix_saved");
-            } else {
-                std::cerr << "ERROR: Combine failed for " << matrix_name << std::endl;
-            }
+	                }
+	                send_ack("ACK_combined_matrix_saved");
+	                if (use_flash_combine) {
+	                    std::lock_guard<std::mutex> lock(flash_atten_openartion_combine_mutex);
+	                    flash_atten_openartion_combine_list.erase(matrix_name);
+	                }
+	            } else {
+	                std::cerr << "ERROR: Combine failed for " << matrix_name << std::endl;
+	            }
 
-            return true;
+	            return true;
 
 #if 0
             // ============================================================
@@ -2267,6 +2862,10 @@ class llama_zmq_server
                             full = is_system2
                                 ? combine_matrix_shards_grid_2d(combined)
                                 : combine_matrix_shards_2d(combined);
+
+                            //matrix_backend_llama.combine_matrix_shards_2d_ggml(combined);
+                            //matrix_backend_llama.combine_matrix_shards_grid_2d_ggml(combined);
+
                         }
 
 	                        if (full.data)
@@ -2403,10 +3002,9 @@ class llama_zmq_server
 #endif
         }
 
-        MatrixResult combine_matrix_shards_2d(combined_matrix_shards& combined)
-        {
-            MatrixResult result;
-
+	    MatrixResult combine_matrix_shards_2d(combined_matrix_shards& combined)
+	    {
+	        MatrixResult result;
             if (combined.shards.empty()) {
                 return result;
             }
@@ -2442,33 +3040,39 @@ class llama_zmq_server
             int fixed_rows = -1;
             int fixed_cols = -1;
 
-            if (join_dim == 0) {
-                for (int idx : order) {
-                    const auto it = combined.shards.find(idx);
-                    if (it == combined.shards.end()) {
-                        throw std::runtime_error("Missing shard index during combine");
-                    }
-                    const auto& s = it->second;
-                    if (fixed_cols < 0) fixed_cols = s.cols;
-                    if (s.cols != fixed_cols) {
-                        throw std::runtime_error("Shard col mismatch for join_dim=0");
-                    }
-                    total_rows += s.rows;
-                }
+	            if (join_dim == 0) {
+	                for (int idx : order) {
+	                    const auto it = combined.shards.find(idx);
+	                    if (it == combined.shards.end()) {
+	                        throw std::runtime_error("Missing shard index during combine");
+	                    }
+	                    const auto& s = it->second;
+	                    if (s.batch != 1 || s.depth != 1) {
+	                        throw std::runtime_error("combine_matrix_shards_2d expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    if (fixed_cols < 0) fixed_cols = s.cols;
+	                    if (s.cols != fixed_cols) {
+	                        throw std::runtime_error("Shard col mismatch for join_dim=0");
+	                    }
+	                    total_rows += s.rows;
+	                }
                 total_cols = fixed_cols;
-            } else {
-                for (int idx : order) {
-                    const auto it = combined.shards.find(idx);
-                    if (it == combined.shards.end()) {
-                        throw std::runtime_error("Missing shard index during combine");
-                    }
-                    const auto& s = it->second;
-                    if (fixed_rows < 0) fixed_rows = s.rows;
-                    if (s.rows != fixed_rows) {
-                        throw std::runtime_error("Shard row mismatch for join_dim=1");
-                    }
-                    total_cols += s.cols;
-                }
+	            } else {
+	                for (int idx : order) {
+	                    const auto it = combined.shards.find(idx);
+	                    if (it == combined.shards.end()) {
+	                        throw std::runtime_error("Missing shard index during combine");
+	                    }
+	                    const auto& s = it->second;
+	                    if (s.batch != 1 || s.depth != 1) {
+	                        throw std::runtime_error("combine_matrix_shards_2d expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    if (fixed_rows < 0) fixed_rows = s.rows;
+	                    if (s.rows != fixed_rows) {
+	                        throw std::runtime_error("Shard row mismatch for join_dim=1");
+	                    }
+	                    total_cols += s.cols;
+	                }
                 total_rows = fixed_rows;
             }
 
@@ -2483,15 +3087,18 @@ class llama_zmq_server
             const size_t total = static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols);
             result.data = std::make_unique<float[]>(total);
 
-            if (join_dim == 0) {
-                int row_off = 0;
-                for (int idx : order) {
-                    auto it = combined.shards.find(idx);
-                    auto& s = it->second;
-                    const size_t shard_elems = static_cast<size_t>(s.rows) * static_cast<size_t>(s.cols);
-                    if (!s.data || shard_elems == 0) {
-                        throw std::runtime_error("Missing shard payload during combine");
-                    }
+	            if (join_dim == 0) {
+	                int row_off = 0;
+	                for (int idx : order) {
+	                    auto it = combined.shards.find(idx);
+	                    auto& s = it->second;
+	                    if (s.batch != 1 || s.depth != 1) {
+	                        throw std::runtime_error("combine_matrix_shards_2d expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    const size_t shard_elems = static_cast<size_t>(s.rows) * static_cast<size_t>(s.cols);
+	                    if (!s.data || shard_elems == 0) {
+	                        throw std::runtime_error("Missing shard payload during combine");
+	                    }
                     std::memcpy(
                         result.data.get() + static_cast<size_t>(row_off) * static_cast<size_t>(total_cols),
                         s.data.get(),
@@ -2500,14 +3107,17 @@ class llama_zmq_server
                     row_off += s.rows;
                     s.data.reset();
                 }
-            } else {
-                int col_off = 0;
-                for (int idx : order) {
-                    auto it = combined.shards.find(idx);
-                    auto& s = it->second;
-                    if (!s.data) {
-                        throw std::runtime_error("Missing shard payload during combine");
-                    }
+	            } else {
+	                int col_off = 0;
+	                for (int idx : order) {
+	                    auto it = combined.shards.find(idx);
+	                    auto& s = it->second;
+	                    if (s.batch != 1 || s.depth != 1) {
+	                        throw std::runtime_error("combine_matrix_shards_2d expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    if (!s.data) {
+	                        throw std::runtime_error("Missing shard payload during combine");
+	                    }
                     for (int r = 0; r < total_rows; ++r) {
                         float* dst = result.data.get()
                             + static_cast<size_t>(r) * static_cast<size_t>(total_cols)
@@ -2653,8 +3263,349 @@ class llama_zmq_server
             std::cout << "Torch combine complete → shape ("
                     << result.dims[2] << " x " << result.dims[3] << ")\n";
 
-            return result;
+	            return result;
 #endif
+	    }
+
+        // FlashAttention outputs can be 4D (batch/depth/rows/cols). For combine/send-back,
+        // we flatten the leading dims into a 2D matrix of shape:
+        //   rows2d = batch * depth * rows
+        //   cols2d = cols
+        MatrixResult combine_flash_attn_shards(combined_matrix_shards& combined)
+        {
+            MatrixResult result;
+
+            if (combined.shards.empty()) {
+                return result;
+            }
+
+            const int expected = combined.number_of_shards_needed;
+            if (expected <= 0) {
+                throw std::runtime_error("combine_flash_attn_shards called without known shard count");
+            }
+            if (static_cast<int>(combined.shards.size()) != expected) {
+                throw std::runtime_error("combine_flash_attn_shards missing shards");
+            }
+
+            std::vector<int> order;
+            order.reserve((size_t)expected);
+
+            if (combined.have_index_range &&
+                (combined.max_shard_index - combined.min_shard_index + 1 == expected)) {
+                for (int i = combined.min_shard_index; i <= combined.max_shard_index; ++i) {
+                    order.push_back(i);
+                }
+            } else {
+                for (const auto& kv : combined.shards) {
+                    order.push_back(kv.first);
+                }
+                std::sort(order.begin(), order.end());
+            }
+
+            const int join_dim = combined.join_dim;
+            if (join_dim != 0 && join_dim != 1) {
+                throw std::runtime_error("combine_flash_attn_shards only supports join_dim 0 or 1");
+            }
+
+            int64_t total_rows = 0;
+            int total_cols = 0;
+            int64_t fixed_rows = -1;
+            int fixed_cols = -1;
+
+            auto rows2d = [](const combined_matrix_shards::ShardView& s) -> int64_t {
+                return (int64_t)s.batch * (int64_t)s.depth * (int64_t)s.rows;
+            };
+
+            if (join_dim == 0) {
+                for (int idx : order) {
+                    const auto it = combined.shards.find(idx);
+                    if (it == combined.shards.end()) {
+                        throw std::runtime_error("Missing shard index during flash combine");
+                    }
+
+                    const auto& s = it->second;
+                    const int64_t r2 = rows2d(s);
+                    if (r2 <= 0) {
+                        throw std::runtime_error("Invalid shard rows during flash combine");
+                    }
+
+                    if (fixed_cols < 0) fixed_cols = s.cols;
+                    if (s.cols != fixed_cols) {
+                        throw std::runtime_error("Shard col mismatch for flash join_dim=0");
+                    }
+
+                    total_rows += r2;
+                }
+                total_cols = fixed_cols;
+            } else {
+                for (int idx : order) {
+                    const auto it = combined.shards.find(idx);
+                    if (it == combined.shards.end()) {
+                        throw std::runtime_error("Missing shard index during flash combine");
+                    }
+
+                    const auto& s = it->second;
+                    const int64_t r2 = rows2d(s);
+                    if (r2 <= 0) {
+                        throw std::runtime_error("Invalid shard rows during flash combine");
+                    }
+
+                    if (fixed_rows < 0) fixed_rows = r2;
+                    if (r2 != fixed_rows) {
+                        throw std::runtime_error("Shard row mismatch for flash join_dim=1");
+                    }
+
+                    total_cols += s.cols;
+                }
+                total_rows = fixed_rows;
+            }
+
+            if (total_rows <= 0 || total_cols <= 0) {
+                throw std::runtime_error("Invalid flash combined shape");
+            }
+            if (total_rows > std::numeric_limits<int>::max()) {
+                throw std::runtime_error("Flash combined rows exceed int range");
+            }
+
+            result.dims[0] = 1;
+            result.dims[1] = 1;
+            result.dims[2] = (int)total_rows;
+            result.dims[3] = total_cols;
+
+            const size_t total =
+                static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols);
+            result.data = std::make_unique<float[]>(total);
+
+            if (join_dim == 0) {
+                int64_t row_off = 0;
+                for (int idx : order) {
+                    auto it = combined.shards.find(idx);
+                    auto& s = it->second;
+
+                    const int64_t r2 = rows2d(s);
+                    const size_t shard_elems =
+                        static_cast<size_t>(r2) * static_cast<size_t>(s.cols);
+
+                    if (!s.data || shard_elems == 0) {
+                        throw std::runtime_error("Missing shard payload during flash combine");
+                    }
+
+                    std::memcpy(
+                        result.data.get()
+                            + static_cast<size_t>(row_off) * static_cast<size_t>(total_cols),
+                        s.data.get(),
+                        shard_elems * sizeof(float)
+                    );
+
+                    row_off += r2;
+                }
+            } else {
+                int col_off = 0;
+                for (int idx : order) {
+                    auto it = combined.shards.find(idx);
+                    auto& s = it->second;
+
+                    const int64_t r2 = rows2d(s);
+                    if (!s.data) {
+                        throw std::runtime_error("Missing shard payload during flash combine");
+                    }
+
+                    for (int64_t r = 0; r < r2; ++r) {
+                        std::memcpy(
+                            result.data.get()
+                                + static_cast<size_t>(r) * static_cast<size_t>(total_cols)
+                                + (size_t)col_off,
+                            s.data.get()
+                                + static_cast<size_t>(r) * static_cast<size_t>(s.cols),
+                            static_cast<size_t>(s.cols) * sizeof(float)
+                        );
+                    }
+
+                    col_off += s.cols;
+                }
+            }
+
+            return result;
+        }
+
+        // System-2 grid variant for FlashAttention/4D payloads.
+        // We flatten (batch*depth*rows) to a 2D height before tiling.
+        MatrixResult combine_flash_attn_shards_grid_2d(combined_matrix_shards& combined)
+        {
+            MatrixResult result;
+
+            if (combined.shards.empty()) {
+                return result;
+            }
+
+            const int expected = combined.number_of_shards_needed;
+            if (expected <= 0) {
+                throw std::runtime_error(
+                    "combine_flash_attn_shards_grid_2d called without known shard count"
+                );
+            }
+            if (static_cast<int>(combined.shards.size()) != expected) {
+                throw std::runtime_error(
+                    "combine_flash_attn_shards_grid_2d missing shards"
+                );
+            }
+
+            // System-2 dispatch is a 2 x N grid.
+            constexpr int row_parts = 2;
+            if (expected % row_parts != 0) {
+                throw std::runtime_error(
+                    "System-2 grid expects an even number of shards"
+                );
+            }
+            const int col_parts = expected / row_parts;
+
+            int min_i = 0;
+            int max_i = -1;
+            if (combined.have_index_range) {
+                min_i = combined.min_shard_index;
+                max_i = combined.max_shard_index;
+            } else {
+                min_i = std::numeric_limits<int>::max();
+                max_i = std::numeric_limits<int>::min();
+                for (const auto& kv : combined.shards) {
+                    min_i = std::min(min_i, kv.first);
+                    max_i = std::max(max_i, kv.first);
+                }
+            }
+
+            if (max_i - min_i + 1 != expected) {
+                throw std::runtime_error(
+                    "System-2 combine expects contiguous shard indices; got gaps"
+                );
+            }
+
+            std::vector<combined_matrix_shards::ShardView*> grid(
+                (size_t)expected,
+                nullptr
+            );
+            for (int i = min_i; i <= max_i; ++i) {
+                auto it = combined.shards.find(i);
+                if (it == combined.shards.end()) {
+                    throw std::runtime_error(
+                        "Missing System-2 shard index during combine"
+                    );
+                }
+                grid[(size_t)(i - min_i)] = &it->second;
+            }
+
+            auto rows2d = [](const combined_matrix_shards::ShardView& s) -> int64_t {
+                return (int64_t)s.batch * (int64_t)s.depth * (int64_t)s.rows;
+            };
+
+            std::vector<int> row_heights((size_t)row_parts, 0);
+            std::vector<int> col_widths((size_t)col_parts, 0);
+
+            for (int r = 0; r < row_parts; ++r) {
+                auto* t0 = grid[(size_t)(r * col_parts)];
+                if (!t0) {
+                    throw std::runtime_error("Missing System-2 shard block");
+                }
+
+                const int64_t h = rows2d(*t0);
+                if (h <= 0 || h > std::numeric_limits<int>::max()) {
+                    throw std::runtime_error(
+                        "Invalid System-2 shard height during flash combine"
+                    );
+                }
+
+                row_heights[(size_t)r] = (int)h;
+
+                for (int c = 0; c < col_parts; ++c) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    if (!blk) {
+                        throw std::runtime_error("Missing System-2 shard block");
+                    }
+
+                    const int64_t bh = rows2d(*blk);
+                    if (bh != row_heights[(size_t)r]) {
+                        throw std::runtime_error(
+                            "System-2 row-block height mismatch within same row"
+                        );
+                    }
+                }
+            }
+
+            for (int c = 0; c < col_parts; ++c) {
+                auto* t0 = grid[(size_t)c];
+                if (!t0) {
+                    throw std::runtime_error("Missing System-2 shard block");
+                }
+
+                col_widths[(size_t)c] = t0->cols;
+
+                for (int r = 0; r < row_parts; ++r) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    if (!blk) {
+                        throw std::runtime_error("Missing System-2 shard block");
+                    }
+
+                    if (blk->cols != col_widths[(size_t)c]) {
+                        throw std::runtime_error(
+                            "System-2 col-block width mismatch within same column"
+                        );
+                    }
+                }
+            }
+
+            int total_rows = 0;
+            for (int r = 0; r < row_parts; ++r) {
+                total_rows += row_heights[(size_t)r];
+            }
+
+            int total_cols = 0;
+            for (int c = 0; c < col_parts; ++c) {
+                total_cols += col_widths[(size_t)c];
+            }
+
+            if (total_rows <= 0 || total_cols <= 0) {
+                throw std::runtime_error("Invalid System-2 combined shape");
+            }
+
+            result.dims[0] = 1;
+            result.dims[1] = 1;
+            result.dims[2] = total_rows;
+            result.dims[3] = total_cols;
+
+            const size_t total =
+                static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols);
+            result.data = std::make_unique<float[]>(total);
+
+            int row_off = 0;
+            for (int r = 0; r < row_parts; ++r) {
+                int col_off = 0;
+                for (int c = 0; c < col_parts; ++c) {
+                    auto* blk = grid[(size_t)(r * col_parts + c)];
+                    const int64_t h = rows2d(*blk);
+                    const int w = blk->cols;
+
+                    if (!blk->data) {
+                        throw std::runtime_error(
+                            "Missing shard payload during System-2 flash combine"
+                        );
+                    }
+
+                    for (int rr = 0; rr < (int)h; ++rr) {
+                        std::memcpy(
+                            result.data.get()
+                                + (size_t)(row_off + rr) * (size_t)total_cols
+                                + (size_t)col_off,
+                            blk->data.get()
+                                + (size_t)rr * (size_t)w,
+                            (size_t)w * sizeof(float)
+                        );
+                    }
+
+                    col_off += w;
+                }
+                row_off += row_heights[(size_t)r];
+            }
+
+            return result;
         }
 
         MatrixResult combine_matrix_shards_grid_2d(combined_matrix_shards& combined)
@@ -2711,31 +3662,43 @@ class llama_zmq_server
             std::vector<int> row_heights((size_t)row_parts, 0);
             std::vector<int> col_widths((size_t)col_parts, 0);
 
-            for (int r = 0; r < row_parts; ++r) {
-                auto* t0 = grid[(size_t)(r * col_parts)];
-                if (!t0) throw std::runtime_error("Missing System-2 shard block");
-                row_heights[(size_t)r] = t0->rows;
-                for (int c = 0; c < col_parts; ++c) {
-                    auto* blk = grid[(size_t)(r * col_parts + c)];
-                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
-                    if (blk->rows != row_heights[(size_t)r]) {
-                        throw std::runtime_error("System-2 row-block height mismatch within same row");
-                    }
-                }
-            }
+	            for (int r = 0; r < row_parts; ++r) {
+	                auto* t0 = grid[(size_t)(r * col_parts)];
+	                if (!t0) throw std::runtime_error("Missing System-2 shard block");
+	                if (t0->batch != 1 || t0->depth != 1) {
+	                    throw std::runtime_error("System-2 combine expects 2D shards (batch=1, depth=1)");
+	                }
+	                row_heights[(size_t)r] = t0->rows;
+	                for (int c = 0; c < col_parts; ++c) {
+	                    auto* blk = grid[(size_t)(r * col_parts + c)];
+	                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
+	                    if (blk->batch != 1 || blk->depth != 1) {
+	                        throw std::runtime_error("System-2 combine expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    if (blk->rows != row_heights[(size_t)r]) {
+	                        throw std::runtime_error("System-2 row-block height mismatch within same row");
+	                    }
+	                }
+	            }
 
-            for (int c = 0; c < col_parts; ++c) {
-                auto* t0 = grid[(size_t)c];
-                if (!t0) throw std::runtime_error("Missing System-2 shard block");
-                col_widths[(size_t)c] = t0->cols;
-                for (int r = 0; r < row_parts; ++r) {
-                    auto* blk = grid[(size_t)(r * col_parts + c)];
-                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
-                    if (blk->cols != col_widths[(size_t)c]) {
-                        throw std::runtime_error("System-2 col-block width mismatch within same column");
-                    }
-                }
-            }
+	            for (int c = 0; c < col_parts; ++c) {
+	                auto* t0 = grid[(size_t)c];
+	                if (!t0) throw std::runtime_error("Missing System-2 shard block");
+	                if (t0->batch != 1 || t0->depth != 1) {
+	                    throw std::runtime_error("System-2 combine expects 2D shards (batch=1, depth=1)");
+	                }
+	                col_widths[(size_t)c] = t0->cols;
+	                for (int r = 0; r < row_parts; ++r) {
+	                    auto* blk = grid[(size_t)(r * col_parts + c)];
+	                    if (!blk) throw std::runtime_error("Missing System-2 shard block");
+	                    if (blk->batch != 1 || blk->depth != 1) {
+	                        throw std::runtime_error("System-2 combine expects 2D shards (batch=1, depth=1)");
+	                    }
+	                    if (blk->cols != col_widths[(size_t)c]) {
+	                        throw std::runtime_error("System-2 col-block width mismatch within same column");
+	                    }
+	                }
+	            }
 
             int total_rows = 0;
             for (int r = 0; r < row_parts; ++r) total_rows += row_heights[(size_t)r];
@@ -2994,127 +3957,208 @@ class llama_zmq_server
                 // ============================================================
                 // BACKEND: LLAMA / GGML / VULKAN
                 // ============================================================
-	                if (backend_type == "llama")
-	                {
-	                    int rows_A = matrixA.rows_A;
-	                    int cols_A = matrixA.cols_A;
-	                    int batchA = matrixA.batchA;
-	                    int depthA = matrixA.depthA;
-	                    int rows_B = matrixB.rows_A;
-	                    int cols_B = matrixB.cols_A;
-	                    int batchB = matrixB.batchA;
-	                    int depthB = matrixB.depthA;
+	            if (backend_type == "llama")
+	            {
+	                int rows_A = matrixA.rows_A;
+	                int cols_A = matrixA.cols_A;
+	                int batchA = matrixA.batchA;
+	                int depthA = matrixA.depthA;
+	                int rows_B = matrixB.rows_A;
+	                int cols_B = matrixB.cols_A;
+	                int batchB = matrixB.batchA;
+	                int depthB = matrixB.depthA;
 
-	                    if (!matrixA.data || !matrixB.data) {
-	                        throw std::runtime_error("Missing matrix data for llama backend inputs");
-	                    }
+                    std::cout << "Matrix A shape:" << std::endl;
+                    std::cout << "  rows_A: " << rows_A << std::endl;
+                    std::cout << "  cols_A: " << cols_A << std::endl;
+                    std::cout << "  batchA: " << batchA << std::endl;
+                    std::cout << "  depthA: " << depthA << std::endl;
+
+                    std::cout << "Matrix B shape:" << std::endl;
+                    std::cout << "  rows_B: " << rows_B << std::endl;
+                    std::cout << "  cols_B: " << cols_B << std::endl;
+                    std::cout << "  batchB: " << batchB << std::endl;
+                    std::cout << "  depthB: " << depthB << std::endl;
+
+
+	                if (!matrixA.data || !matrixB.data) {
+	                    throw std::runtime_error("Missing matrix data for llama backend inputs");
+	                }
+
+                    // Pre-check shapes to avoid ggml assertion failures for invalid ops.
+                    {
+                        int check_rows_A = rows_A;
+                        int check_cols_A = cols_A;
+                        int check_rows_B = rows_B;
+                        int check_cols_B = cols_B;
+                        if (transposeA) std::swap(check_rows_A, check_cols_A);
+                        if (transposeB) std::swap(check_rows_B, check_cols_B);
+
+                        const int dims_a[4] = { check_cols_A, check_rows_A, depthA, batchA };
+                        const int dims_b[4] = { check_cols_B, check_rows_B, depthB, batchB };
+
+                        auto invalid_dim = [](const int dims[4]) {
+                            for (int i = 0; i < 4; ++i) {
+                                if (dims[i] <= 0) return true;
+                            }
+                            return false;
+                        };
+
+                        auto print_dims = [](const char* name, const int dims[4]) {
+                            std::cerr << "  " << name << " [cols,rows,depth,batch] = ["
+                                      << dims[0] << "," << dims[1] << ","
+                                      << dims[2] << "," << dims[3] << "]" << std::endl;
+                        };
+
+                        if (invalid_dim(dims_a) || invalid_dim(dims_b)) {
+                            std::cerr << "❌ Invalid (non-positive) tensor dimensions for GGML op '"
+                                      << operation_type << "' after transpose"
+                                      << " (transposeA=" << (transposeA ? "true" : "false")
+                                      << ", transposeB=" << (transposeB ? "true" : "false") << ")." << std::endl;
+                            print_dims("A", dims_a);
+                            print_dims("B", dims_b);
+                            return false;
+                        }
+
+                        if (operation_type == "mul" || operation_type == "matmul") {
+                            const bool can_mul =
+                                (dims_a[0] == dims_b[0]) &&
+                                (dims_b[2] % dims_a[2] == 0) &&
+                                (dims_b[3] % dims_a[3] == 0);
+                            if (!can_mul) {
+                                std::cerr << "❌ GGML mul_mat shape mismatch after transpose"
+                                          << " (transposeA=" << (transposeA ? "true" : "false")
+                                          << ", transposeB=" << (transposeB ? "true" : "false") << ")." << std::endl;
+                                print_dims("A", dims_a);
+                                print_dims("B", dims_b);
+                                std::cerr << "  Expected: A.cols == B.cols, "
+                                          << "B.depth % A.depth == 0, B.batch % A.batch == 0." << std::endl;
+                                return false;
+                            }
+                        } else if (operation_type == "add" || operation_type == "sub") {
+                            const bool can_repeat =
+                                (dims_a[0] % dims_b[0] == 0) &&
+                                (dims_a[1] % dims_b[1] == 0) &&
+                                (dims_a[2] % dims_b[2] == 0) &&
+                                (dims_a[3] % dims_b[3] == 0);
+                            if (!can_repeat) {
+                                std::cerr << "❌ GGML " << operation_type << " shape mismatch after transpose"
+                                          << " (transposeA=" << (transposeA ? "true" : "false")
+                                          << ", transposeB=" << (transposeB ? "true" : "false") << ")." << std::endl;
+                                print_dims("A", dims_a);
+                                print_dims("B", dims_b);
+                                std::cerr << "  Expected: A dims must be repeatable by B (A % B == 0 for each dim)." << std::endl;
+                                return false;
+                            }
+                        }
+                    }
 
 	                    // Only lock long enough to read the backend vector; release before compute
-	                    ggml_backend_t backend;
-	                    {
-	                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
-	                        backend =
-	                            (use_gpu && gpu_id >= 0 &&
-	                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
-	                            ? matrix_backend_llama.ggml_backends[gpu_id]
-	                            : matrix_backend_llama.ggml_backends.back();
-	                    }
+	                ggml_backend_t backend;
+	                {
+	                    std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+	                    backend =
+	                        (use_gpu && gpu_id >= 0 &&
+	                        gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+	                        ? matrix_backend_llama.ggml_backends[gpu_id]
+	                        : matrix_backend_llama.ggml_backends.back();
+	                }
 
-	                    MatrixResult result;
-	                    result.dims[0] = result.dims[1] = result.dims[2] = result.dims[3] = 0;
+	                MatrixResult result;
+	                result.dims[0] = result.dims[1] = result.dims[2] = result.dims[3] = 0;
 
-	                    // Fast path: use cached GGML tensors in VRAM when requested and possible.
-	                    const bool can_use_vram =
-	                        use_gpu &&
-	                        !transposeA &&
-	                        !transposeB &&
-	                        gpu_id >= 0 &&
-	                        gpu_id < (int)matrix_backend_llama.ggml_backends.size();
+	                // Fast path: use cached GGML tensors in VRAM when requested and possible.
+	                const bool can_use_vram =
+	                    use_gpu &&
+	                    !transposeA &&
+	                    !transposeB &&
+	                    gpu_id >= 0 &&
+	                    gpu_id < (int)matrix_backend_llama.ggml_backends.size();
 
-	                    if (can_use_vram) {
-	                        auto& vram = get_vram_cache_manager();
-	                        if (vram.enabled(gpu_id)) {
-	                            if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
-	                                vram.cache_tensor_f32_4d(
-	                                    gpu_id,
-	                                    matrixA.base_file_name,
-	                                    matrixA.data->data(),
-	                                    cols_A,
-	                                    rows_A,
-	                                    depthA,
-	                                    batchA
-	                                );
-	                            }
-	                            if (!vram.get_tensor(gpu_id, matrixB.base_file_name)) {
-	                                vram.cache_tensor_f32_4d(
-	                                    gpu_id,
-	                                    matrixB.base_file_name,
-	                                    matrixB.data->data(),
-	                                    cols_B,
-	                                    rows_B,
-	                                    depthB,
-	                                    batchB
-	                                );
-	                            }
+	                if (can_use_vram) {
+	                    auto& vram = get_vram_cache_manager();
+	                    if (vram.enabled(gpu_id)) {
+	                        if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
+	                            vram.cache_tensor_f32_4d(
+	                                gpu_id,
+	                                matrixA.base_file_name,
+	                                matrixA.data->data(),
+	                                cols_A,
+	                                rows_A,
+	                                depthA,
+	                                batchA
+	                            );
+	                        }
+	                        if (!vram.get_tensor(gpu_id, matrixB.base_file_name)) {
+	                            vram.cache_tensor_f32_4d(
+	                                gpu_id,
+	                                matrixB.base_file_name,
+	                                matrixB.data->data(),
+	                                cols_B,
+	                                rows_B,
+	                                depthB,
+	                                batchB
+	                            );
+	                        }
 
-	                            ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
-	                            ggml_tensor* b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
-	                            if (a_t && b_t) {
-	                                result = matrix_backend_llama.matrix_op_nd_tensors(a_t, b_t, backend, operation_type);
-	                            }
+	                        ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
+	                        ggml_tensor* b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
+	                        if (a_t && b_t) {
+	                            result = matrix_backend_llama.matrix_op_nd_tensors(a_t, b_t, backend, operation_type);
 	                        }
 	                    }
+	                }
 
 	                    // Fallback: host path (still runs on GPU if requested)
-	                    if (!result.data) {
-	                        const float* a_ptr = matrixA.data->data();
-	                        const float* b_ptr = matrixB.data->data();
-	                        std::unique_ptr<float[]> a_tmp;
-	                        std::unique_ptr<float[]> b_tmp;
+	                if (!result.data) {
+	                    const float* a_ptr = matrixA.data->data();
+	                    const float* b_ptr = matrixB.data->data();
+	                    std::unique_ptr<float[]> a_tmp;
+	                    std::unique_ptr<float[]> b_tmp;
 
-	                        if (transposeA) {
-	                            a_tmp = (depthA > 1 || batchA > 1)
-	                                ? matrix_backend_llama.transpose_4d(const_cast<float*>(a_ptr), batchA, depthA, rows_A, cols_A)
-	                                : matrix_backend_llama.transpose_2d(const_cast<float*>(a_ptr), rows_A, cols_A);
-	                            a_ptr = a_tmp.get();
-	                            std::swap(rows_A, cols_A);
-	                        }
+	                    if (transposeA) {
+	                        a_tmp = (depthA > 1 || batchA > 1)
+	                            ? matrix_backend_llama.transpose_4d(const_cast<float*>(a_ptr), batchA, depthA, rows_A, cols_A)
+	                            : matrix_backend_llama.transpose_2d(const_cast<float*>(a_ptr), rows_A, cols_A);
+	                        a_ptr = a_tmp.get();
+	                        std::swap(rows_A, cols_A);
+	                    }
 
-	                        if (transposeB) {
-	                            b_tmp = (depthB > 1 || batchB > 1)
-	                                ? matrix_backend_llama.transpose_4d(const_cast<float*>(b_ptr), batchB, depthB, rows_B, cols_B)
-	                                : matrix_backend_llama.transpose_2d(const_cast<float*>(b_ptr), rows_B, cols_B);
-	                            b_ptr = b_tmp.get();
-	                            std::swap(rows_B, cols_B);
-	                        }
+	                    if (transposeB) {
+	                        b_tmp = (depthB > 1 || batchB > 1)
+	                            ? matrix_backend_llama.transpose_4d(const_cast<float*>(b_ptr), batchB, depthB, rows_B, cols_B)
+	                            : matrix_backend_llama.transpose_2d(const_cast<float*>(b_ptr), rows_B, cols_B);
+	                        b_ptr = b_tmp.get();
+	                        std::swap(rows_B, cols_B);
+	                    }
 
-	                        int dims_a[4] = { cols_A, rows_A, depthA, batchA };
-	                        int dims_b[4] = { cols_B, rows_B, depthB, batchB };
+	                    int dims_a[4] = { cols_A, rows_A, depthA, batchA };
+	                    int dims_b[4] = { cols_B, rows_B, depthB, batchB };
 
+		                    result = matrix_backend_llama.matrix_op_nd(
+		                        const_cast<float*>(a_ptr), dims_a,
+		                        const_cast<float*>(b_ptr), dims_b,
+		                        backend, operation_type
+		                    );
+
+		                        // If GPU compute fails (often due to VRAM pressure), retry on CPU backend.
+		                    if (!result.data && use_gpu) {
+		                        ggml_backend_t cpu_backend;
+		                        {
+		                            std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+		                            cpu_backend = matrix_backend_llama.ggml_backends.back();
+		                        }
 		                        result = matrix_backend_llama.matrix_op_nd(
 		                            const_cast<float*>(a_ptr), dims_a,
 		                            const_cast<float*>(b_ptr), dims_b,
-		                            backend, operation_type
+		                            cpu_backend, operation_type
 		                        );
-
-		                        // If GPU compute fails (often due to VRAM pressure), retry on CPU backend.
-		                        if (!result.data && use_gpu) {
-		                            ggml_backend_t cpu_backend;
-		                            {
-		                                std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
-		                                cpu_backend = matrix_backend_llama.ggml_backends.back();
-		                            }
-		                            result = matrix_backend_llama.matrix_op_nd(
-		                                const_cast<float*>(a_ptr), dims_a,
-		                                const_cast<float*>(b_ptr), dims_b,
-		                                cpu_backend, operation_type
-		                            );
-		                        }
 		                    }
+		                }
 
-		                    if (!result.data) {
-		                        throw std::runtime_error("GGML operation failed (no result data) for output: " + output_filename);
-		                    }
+		                if (!result.data) {
+		                    throw std::runtime_error("GGML operation failed (no result data) for output: " + output_filename);
+		                }
 
                     if (result.dims[0] == 0 && result.dims[1] == 0) {
                         result.dims[0] = 1;
@@ -3352,6 +4396,1278 @@ class llama_zmq_server
             try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
             return op_success;
         }
+
+        bool transformer_operation(
+            const std::string& transformer_op_select,
+            const matrix_shard_object& matrixA,
+            bool transposeA,
+            bool use_gpu,
+            int gpu_id,
+            int send_back,
+            const std::string& operation_type,
+            int dim,
+            int shard_index_override
+        )
+        {
+            bool op_success = false;
+
+            try {
+                std::cout << "🚀 TRANSFORMER OP - Backend: " << transformer_op_select << std::endl;
+
+                // ---------------- Output filename ----------------
+                std::string output_filename = matrixA.base_file_name;
+
+                if (shard_index_override >= 0) {
+                    size_t dot = output_filename.rfind(".bin");
+                    std::string base = (dot != std::string::npos)
+                                    ? output_filename.substr(0, dot)
+                                    : output_filename;
+                    output_filename = base + "_shard_" + std::to_string(shard_index_override) + ".bin";
+                }
+
+                const int output_dtype_tag = matrixA.output_dtype_tag;
+
+                // ============================================================
+                // BACKEND: LLAMA / GGML
+                // ============================================================
+                if (transformer_op_select == "llama") {
+
+                    int rows  = matrixA.rows_A;
+                    int cols  = matrixA.cols_A;
+                    int batch = matrixA.batchA;
+                    int depth = matrixA.depthA;
+
+                    if (!matrixA.data) {
+                        throw std::runtime_error("Missing matrix data for transformer operation");
+                    }
+
+                    ggml_backend_t backend;
+                    {
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                        backend = (use_gpu && gpu_id >= 0 &&
+                                gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+                                ? matrix_backend_llama.ggml_backends[gpu_id]
+                                : matrix_backend_llama.ggml_backends.back();
+                    }
+
+                    MatrixResult result;
+                    result.dims[0] = result.dims[1] = result.dims[2] = result.dims[3] = 0;
+
+                    // ---------------- VRAM fast path (NO transpose) ----------------
+                    if (use_gpu && !transposeA &&
+                        gpu_id >= 0 &&
+                        gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+                    {
+                        auto& vram = get_vram_cache_manager();
+
+                        if (vram.enabled(gpu_id)) {
+                            if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
+                                vram.cache_tensor_f32_4d(
+                                    gpu_id,
+                                    matrixA.base_file_name,
+                                    matrixA.data->data(),
+                                    cols, rows, depth, batch
+                                );
+                            }
+
+                            ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
+
+                            if (a_t) {
+                                result = matrix_backend_llama.matrix_op_nd(
+                                    nullptr, nullptr,
+                                    nullptr, nullptr,
+                                    backend,
+                                    operation_type
+                                );
+                            }
+                        }
+                    }
+
+                    // ---------------- Host fallback ----------------
+                    if (!result.data) {
+
+                        const float* a_ptr = matrixA.data->data();
+                        std::unique_ptr<float[]> a_tmp;
+
+                        if (transposeA) {
+                            a_tmp = (depth > 1 || batch > 1)
+                                ? matrix_backend_llama.transpose_4d(
+                                    const_cast<float*>(a_ptr),
+                                    batch, depth, rows, cols)
+                                : matrix_backend_llama.transpose_2d(
+                                    const_cast<float*>(a_ptr),
+                                    rows, cols);
+
+                            a_ptr = a_tmp.get();
+                            std::swap(rows, cols);
+                        }
+
+                        int dims_a[4] = { cols, rows, depth, batch };
+                        int dims_b[4] = { 1, 1, 1, 1 }; // dummy
+
+                        result = matrix_backend_llama.matrix_op_nd(
+                            const_cast<float*>(a_ptr), dims_a,
+                            nullptr, dims_b,
+                            backend,
+                            operation_type
+                        );
+
+                        // GPU fallback → CPU
+                        if (!result.data && use_gpu) {
+                            ggml_backend_t cpu_backend;
+                            {
+                                std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                                cpu_backend = matrix_backend_llama.ggml_backends.back();
+                            }
+
+                            result = matrix_backend_llama.matrix_op_nd(
+                                const_cast<float*>(a_ptr), dims_a,
+                                nullptr, dims_b,
+                                cpu_backend,
+                                operation_type
+                            );
+                        }
+                    }
+
+                    if (!result.data) {
+                        throw std::runtime_error("GGML transformer op failed: " + operation_type);
+                    }
+
+                    if (result.dims[0] == 0 && result.dims[1] == 0) {
+                        result.dims[0] = 1;
+                        result.dims[1] = 1;
+                    }
+
+                    // ---------------- Store / Send back ----------------
+                    store_matrix_result_to_shard_list(output_filename, result, output_dtype_tag);
+
+                    if (send_back != 0) {
+                        int abs_send_back = std::abs(send_back);
+
+                        if (abs_send_back == 1) {
+                            // Single shard → immediately send to Python
+                            const bool sent = send_combined_bin_to_python(
+                                output_filename,
+                                result,
+                                output_dtype_tag
+                            );
+                            if (!sent) {
+                                std::cerr << "ERROR: Failed to stream single-shard PT for "
+                                        << output_filename << std::endl;
+                            }
+                            send_ack("ACK_combined_matrix_saved");
+                        } else {
+                            // Multi-shard → send_back_file() triggers combine on head
+                            send_back_file(output_filename, output_filename, result,
+                                        send_back, "llama", output_dtype_tag);
+                        }
+                    }
+
+                    op_success = true;
+                } else {
+                    std::cerr << "❌ Unsupported backend for transformer_operation: "
+                            << transformer_op_select << std::endl;
+                }
+            }
+            catch (const std::exception& e) {
+                std::cerr << "❌ Exception: " << e.what() << std::endl;
+                op_success = false;
+            }
+
+            try { send_ack("ACK_transformerOp_complete"); } catch (...) {}
+            return op_success;
+        }
+
+        bool flash_atten_openartion(  
+            const std::string& backend_type,  
+            const matrix_shard_object& matrixQ,  
+            bool transposeQ,  
+            const matrix_shard_object& matrixK,  
+            bool transposeK,  
+            const matrix_shard_object& matrixV,  
+            bool transposeV,  
+            const matrix_shard_object* matrixMask,
+            float scale,  
+            float max_bias,  
+            float logit_softcap,  
+            bool use_gpu,  
+            int gpu_id,  
+            int send_back,  
+            const std::string& operation_type,  
+            int shard_index_override)  
+        {  
+            bool op_success = false;  
+        
+            try {  
+                if (backend_type != "llama" && backend_type != "torch") {  
+                    throw std::runtime_error("flash_attn only implemented for llama/torch backend");  
+                }  
+        
+                if (!matrixQ.data || !matrixK.data || !matrixV.data) {  
+                    throw std::runtime_error("Missing matrix data for flash_attn inputs");  
+                }  
+        
+                // ---------------- Output filename ----------------  
+                auto strip_bin = [](std::string& name) {  
+                    const size_t pos = name.rfind(".bin");  
+                    if (pos != std::string::npos) name = name.substr(0, pos);  
+                };  
+                auto strip_shard = [](std::string& name) {  
+                    const size_t pos = name.find("_shard_");  
+                    if (pos != std::string::npos) name = name.substr(0, pos);  
+                };  
+                auto base_name = [&](const std::string& file) {  
+                    std::string out = std::filesystem::path(file).filename().string();  
+                    strip_bin(out);  
+                    strip_shard(out);  
+                    return out;  
+                };  
+        
+                const std::string q_name = base_name(matrixQ.base_file_name);  
+                const std::string k_name = base_name(matrixK.base_file_name);  
+                const std::string v_name = base_name(matrixV.base_file_name);  
+                const std::string base_result = q_name + "x" + k_name + "x" + v_name;  
+        
+                // Mark this base as requiring FlashAttention-aware combine on the head node.  
+                const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);  
+                if (is_head_node && send_back != 0) {  
+                    std::lock_guard<std::mutex> lock(flash_atten_openartion_combine_mutex);  
+                    flash_atten_openartion_combine_list.insert(base_result);  
+                }  
+        
+                std::string output_filename = base_result;  
+                int shard_num = shard_index_override;  
+                if (shard_num < 0) {  
+                    std::lock_guard<std::mutex> lock(output_shard_mutex);  
+                    shard_num = output_shard_counters[base_result]++;  
+                }  
+                output_filename += "_shard_" + std::to_string(shard_num) + ".bin";  
+        
+                // dtype tag for downstream saves/streams  
+                int output_dtype_tag = merge_output_dtype_tag(matrixQ.output_dtype_tag, matrixK.output_dtype_tag);  
+                output_dtype_tag = merge_output_dtype_tag(output_dtype_tag, matrixV.output_dtype_tag);  
+
+                const bool has_mask = (matrixMask && matrixMask->data);
+                int colsM = 0, rowsM = 0, depthM = 0, batchM = 0;
+                const float* mask_ptr = nullptr;
+                if (has_mask) {
+                    colsM = matrixMask->cols_A;
+                    rowsM = matrixMask->rows_A;
+                    depthM = matrixMask->depthA;
+                    batchM = matrixMask->batchA;
+                    if (colsM <= 0 || rowsM <= 0 || depthM <= 0 || batchM <= 0) {
+                        throw std::runtime_error("Invalid mask dimensions for flash_attn");
+                    }
+                    mask_ptr = matrixMask->data->data();
+                    if (!mask_ptr) {
+                        throw std::runtime_error("Mask data pointer is null");
+                    }
+                }
+        
+                // After matrix validation, add:  
+                printf("Q dims: [%d,%d,%d,%d] type:%d\n",   
+                    matrixQ.cols_A, matrixQ.rows_A, matrixQ.depthA, matrixQ.batchA,   
+                    matrixQ.output_dtype_tag);  
+                printf("K dims: [%d,%d,%d,%d] type:%d\n",   
+                    matrixK.cols_A, matrixK.rows_A, matrixK.depthA, matrixK.batchA,  
+                    matrixK.output_dtype_tag);  
+                printf("V dims: [%d,%d,%d,%d] type:%d\n",   
+                    matrixV.cols_A, matrixV.rows_A, matrixV.depthA, matrixV.batchA,  
+                    matrixV.output_dtype_tag);
+
+                printf("Input dims - Q: [%d,%d,%d,%d] K: [%d,%d,%d,%d] V: [%d,%d,%d,%d]\n",  
+                    matrixQ.cols_A, matrixQ.rows_A, matrixQ.depthA, matrixQ.batchA,  
+                    matrixK.cols_A, matrixK.rows_A, matrixK.depthA, matrixK.batchA,  
+                    matrixV.cols_A, matrixV.rows_A, matrixV.depthA, matrixV.batchA);
+                MatrixResult result;  
+                result.data = nullptr;  
+                result.dims[0] = result.dims[1] = result.dims[2] = result.dims[3] = 0;  
+
+                if (backend_type == "llama") {
+                    auto dtype_tag_to_ggml = [](int tag) -> ggml_type {  
+                        if (tag == -2) return GGML_TYPE_F16;  
+                        if (tag == -3) return GGML_TYPE_BF16;  
+                        return GGML_TYPE_F32;  
+                    };  
+                    const ggml_type data_type = dtype_tag_to_ggml(output_dtype_tag);
+        
+                    // ---------------- Select backend ----------------  
+                    ggml_backend_t backend;  
+                    {  
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                        backend = (use_gpu && gpu_id >= 0 && gpu_id < (int) matrix_backend_llama.ggml_backends.size())  
+                            ? matrix_backend_llama.ggml_backends[gpu_id]  
+                            : matrix_backend_llama.ggml_backends.back();  
+                    }  
+
+                    // ---------------- VRAM fast-path ----------------  
+                    const bool can_use_vram =  
+                        use_gpu &&  
+                        !transposeQ && !transposeK && !transposeV &&  
+                        gpu_id >= 0 &&  
+                        gpu_id < (int) matrix_backend_llama.ggml_backends.size() &&  
+                        data_type == GGML_TYPE_F32 &&
+                        !has_mask;  
+        
+                    if (can_use_vram) {  
+                        auto& vram = get_vram_cache_manager();  
+        
+                        auto cache_tensor_if_needed = [&](const matrix_shard_object& mat) {  
+                            if (!vram.enabled(gpu_id)) return;  
+                            if (vram.get_tensor(gpu_id, mat.base_file_name)) return;  
+        
+                            vram.cache_tensor_f32_4d(  
+                                gpu_id,  
+                                mat.base_file_name,  
+                                mat.data->data(),  
+                                mat.cols_A,  
+                                mat.rows_A,  
+                                mat.depthA,  
+                                mat.batchA  
+                            );  
+                        };  
+        
+                        cache_tensor_if_needed(matrixQ);  
+                        cache_tensor_if_needed(matrixK);  
+                        cache_tensor_if_needed(matrixV);  
+        
+                        ggml_tensor* q_t = vram.get_tensor(gpu_id, matrixQ.base_file_name);  
+                        ggml_tensor* k_t = vram.get_tensor(gpu_id, matrixK.base_file_name);  
+                        ggml_tensor* v_t = vram.get_tensor(gpu_id, matrixV.base_file_name);  
+        
+                        if (q_t && k_t && v_t) {  
+                            float scale_use = scale;  
+                            if (scale_use <= 0.0f) {  
+                                scale_use = 1.0f / std::sqrt((float) std::max<int64_t>(1, q_t->ne[0]));  
+                            }  
+                            FlashAttnTensorParams p{v_t, nullptr, scale_use, max_bias, logit_softcap};  
+                            result = matrix_backend_llama.matrix_op_nd_tensors(q_t, k_t, backend, operation_type, &p);  
+                        }  
+                    }  
+        
+                // ---------------- Host fallback ----------------  
+                if (!result.data) {
+                    // Host fallback: force F32 tensors to avoid re-quantization/stride issues.
+                    const ggml_type host_type = GGML_TYPE_F32;
+                    int colsQ = matrixQ.cols_A, rowsQ = matrixQ.rows_A, depthQ = matrixQ.depthA, batchQ = matrixQ.batchA;
+                    int colsK = matrixK.cols_A, rowsK = matrixK.rows_A, depthK = matrixK.depthA, batchK = matrixK.batchA;
+                    int colsV = matrixV.cols_A, rowsV = matrixV.rows_A, depthV = matrixV.depthA, batchV = matrixV.batchA;
+        
+                    const float* q_ptr = matrixQ.data->data();
+                    const float* k_ptr = matrixK.data->data();
+                    const float* v_ptr = matrixV.data->data();
+        
+                    std::unique_ptr<float[]> q_tmp;  
+                    std::unique_ptr<float[]> k_tmp;  
+                    std::unique_ptr<float[]> v_tmp;  
+        
+                    if (transposeQ) {  
+                        q_tmp = (depthQ > 1 || batchQ > 1)  
+                            ? matrix_backend_llama.transpose_4d(const_cast<float*>(q_ptr), batchQ, depthQ, rowsQ, colsQ)  
+                            : matrix_backend_llama.transpose_2d(const_cast<float*>(q_ptr), rowsQ, colsQ);  
+                        q_ptr = q_tmp.get();  
+                        std::swap(rowsQ, colsQ);  
+                    }  
+                    if (transposeK) {  
+                        k_tmp = (depthK > 1 || batchK > 1)  
+                            ? matrix_backend_llama.transpose_4d(const_cast<float*>(k_ptr), batchK, depthK, rowsK, colsK)  
+                            : matrix_backend_llama.transpose_2d(const_cast<float*>(k_ptr), rowsQ, colsK);  
+                        k_ptr = k_tmp.get();  
+                        std::swap(rowsK, colsK);  
+                    }  
+                    if (transposeV) {  
+                        v_tmp = (depthV > 1 || batchV > 1)  
+                            ? matrix_backend_llama.transpose_4d(const_cast<float*>(v_ptr), batchV, depthV, rowsV, colsV)  
+                            : matrix_backend_llama.transpose_2d(const_cast<float*>(v_ptr), rowsQ, colsV);  
+                        v_ptr = v_tmp.get();  
+                        std::swap(rowsV, colsV);  
+                    }  
+        
+                    int dimsQ[4] = { colsQ, rowsQ, depthQ, batchQ };  
+                    int dimsK[4] = { colsK, rowsK, depthK, batchK };  
+                    std::cout << "Host dims after transpose Q/K/V: "
+                              << "[" << dimsQ[0] << "," << dimsQ[1] << "," << dimsQ[2] << "," << dimsQ[3] << "] "
+                              << "[" << dimsK[0] << "," << dimsK[1] << "," << dimsK[2] << "," << dimsK[3] << "] "
+                              << "[" << colsV << "," << rowsV << "," << depthV << "," << batchV << "]"
+                              << std::endl;
+        
+                    float scale_use = scale;  
+                    if (scale_use <= 0.0f) {  
+                        scale_use = 1.0f / std::sqrt((float) std::max(1, dimsQ[0]));  
+                    }  
+        
+                    // Build/normalize mask in GGML layout (ne0 = n_kv, ne1 = n_q padded).
+                    int mask_cols = 0;
+                    int mask_rows = 0;
+                    int mask_rows_pad = 0;
+                    int mask_depth = 0;
+                    int mask_batch = 0;
+                    const float* mask_ptr_upload = nullptr;
+                    std::vector<float> mask_f32_work;
+                    if (has_mask) {
+                        const int expected_cols = rowsK; // n_kv
+                        const int expected_rows = rowsQ; // n_q
+                        const bool dims_ok = (colsM == expected_cols && rowsM == expected_rows);
+                        const bool dims_swapped = (colsM == expected_rows && rowsM == expected_cols);
+                        if (!dims_ok && !dims_swapped) {
+                            throw std::runtime_error(
+                                "Mask dims do not match Q/K (expected [n_kv,n_q] or [n_q,n_kv])");
+                        }
+                        if (depthM <= 0 || batchM <= 0) {
+                            throw std::runtime_error("Mask depth/batch invalid");
+                        }
+                        if (depthQ % depthM != 0 || batchQ % batchM != 0) {
+                            throw std::runtime_error("Mask depth/batch not broadcastable to Q/K");
+                        }
+
+                        mask_cols = expected_cols;
+                        mask_rows = expected_rows;
+                        mask_rows_pad = std::max(mask_rows, (int)GGML_PAD(mask_rows, GGML_KQ_MASK_PAD));
+                        mask_depth = depthM;
+                        mask_batch = batchM;
+
+                        const size_t out_elems =
+                            (size_t)mask_cols * mask_rows_pad * mask_depth * mask_batch;
+                        mask_f32_work.assign(out_elems, 0.0f);
+
+                        for (int b = 0; b < mask_batch; ++b) {
+                            for (int d = 0; d < mask_depth; ++d) {
+                                for (int r = 0; r < mask_rows; ++r) {
+                                    for (int c = 0; c < mask_cols; ++c) {
+                                        size_t src_idx;
+                                        if (dims_ok) {
+                                            // mask stored as [rows= n_q, cols= n_kv]
+                                            src_idx = (((size_t)b * depthM + d) * (size_t)rowsM + r) * (size_t)colsM + c;
+                                        } else {
+                                            // mask stored as [rows= n_kv, cols= n_q] -> transpose on read
+                                            src_idx = (((size_t)b * depthM + d) * (size_t)rowsM + c) * (size_t)colsM + r;
+                                        }
+                                        const size_t dst_idx =
+                                            (((size_t)b * mask_depth + d) * (size_t)mask_rows_pad + r) * (size_t)mask_cols + c;
+                                        mask_f32_work[dst_idx] = mask_ptr[src_idx];
+                                    }
+                                }
+                            }
+                        }
+                        mask_ptr_upload = mask_f32_work.data();
+                    }
+
+                    auto run_flash_attn_typed = [&](ggml_backend_t be) -> MatrixResult {
+                        MatrixResult out;
+                        out.data = nullptr;
+                        out.dims[0] = out.dims[1] = out.dims[2] = out.dims[3] = 0;
+        
+                        ggml_context* ctx = matrix_backend_llama.get_thread_graph_ctx(  
+                            0, /*bump_for_flash_attn=*/true);  
+                        if (!ctx) return out;  
+        
+                        ggml_tensor* q_t = ggml_new_tensor_4d(ctx, host_type, dimsQ[0], dimsQ[1], dimsQ[2], dimsQ[3]);
+                        ggml_tensor* k_t = ggml_new_tensor_4d(ctx, host_type, dimsK[0], dimsK[1], dimsK[2], dimsK[3]);
+                        ggml_tensor* v_t = ggml_new_tensor_4d(ctx, host_type, colsV, rowsV, depthV, batchV);
+                        ggml_tensor* mask_t = nullptr;
+                        if (has_mask) {
+                            mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_cols, mask_rows_pad, mask_depth, mask_batch);
+                        }
+                        if (!q_t || !k_t || !v_t || (has_mask && !mask_t)) return out;
+
+                        const size_t type_size = ggml_type_size(host_type);
+                        q_t->nb[0] = type_size;
+                        q_t->nb[1] = q_t->nb[0] * dimsQ[0];
+                        q_t->nb[2] = q_t->nb[1] * dimsQ[1];
+                        q_t->nb[3] = q_t->nb[2] * dimsQ[2];
+        
+                        k_t->nb[0] = type_size;  
+                        k_t->nb[1] = k_t->nb[0] * dimsK[0];  
+                        k_t->nb[2] = k_t->nb[1] * dimsK[1];  
+                        k_t->nb[3] = k_t->nb[2] * dimsK[2];  
+        
+                        v_t->nb[0] = type_size;
+                        v_t->nb[1] = v_t->nb[0] * colsV;
+                        v_t->nb[2] = v_t->nb[1] * rowsV;
+                        v_t->nb[3] = v_t->nb[2] * depthV;
+                        if (mask_t) {
+                            mask_t->nb[0] = sizeof(ggml_fp16_t);
+                            mask_t->nb[1] = mask_t->nb[0] * mask_cols;
+                            mask_t->nb[2] = mask_t->nb[1] * mask_rows_pad;
+                            mask_t->nb[3] = mask_t->nb[2] * mask_depth;
+                        }
+        
+                        ggml_tensor* result_t = ggml_flash_attn_ext(  
+                            ctx, q_t, k_t, v_t, mask_t,  
+                            scale_use, max_bias, logit_softcap);  
+                        if (!result_t) return out;  
+        
+                        ggml_cgraph* gf = ggml_new_graph(ctx);  
+                        ggml_build_forward_expand(gf, result_t);  
+        
+                        if (be && !ggml_backend_supports_op(be, result_t)) {  
+                            return out;  
+                        }  
+        
+                        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);  
+                        if (!buf) return out;  
+        
+                        auto set_tensor_data = [&](ggml_tensor* t, const float* src, int64_t n) {
+                            ggml_backend_tensor_set(
+                                t, src, 0, (size_t)n * sizeof(float));
+                        };
+        
+                        const int64_t n_q = (int64_t)dimsQ[0] * dimsQ[1] * dimsQ[2] * dimsQ[3];  
+                        const int64_t n_k = (int64_t)dimsK[0] * dimsK[1] * dimsK[2] * dimsK[3];  
+                        const int64_t n_v = (int64_t)colsV * rowsV * depthV * batchV;  
+                        set_tensor_data(q_t, q_ptr, n_q);  
+                        set_tensor_data(k_t, k_ptr, n_k);  
+                        set_tensor_data(v_t, v_ptr, n_v);  
+                        if (mask_t && mask_ptr_upload) {
+                            const size_t mask_elems = (size_t)mask_cols * mask_rows_pad * mask_depth * mask_batch;
+                            std::vector<ggml_fp16_t> mask_f16(mask_elems);
+                            ggml_fp32_to_fp16_row(mask_ptr_upload, mask_f16.data(), (int64_t)mask_elems);
+                            ggml_backend_tensor_set(mask_t, mask_f16.data(), 0, ggml_nbytes(mask_t));
+                        }
+        
+                        ggml_backend_graph_compute(be, gf);  
+        
+                        const int64_t total = result_t->ne[3] * result_t->ne[2] * result_t->ne[1] * result_t->ne[0];
+                        // ggml_flash_attn_ext returns ne=[D, H, T, B]. Convert to [B, H, T, D].
+                        out.dims[0] = (int)result_t->ne[3];
+                        out.dims[1] = (int)result_t->ne[1];
+                        out.dims[2] = (int)result_t->ne[2];
+                        out.dims[3] = (int)result_t->ne[0];
+
+                        std::cout << "  flash_attn_ext result ne=["
+                                  << result_t->ne[0] << "," << result_t->ne[1] << ","
+                                  << result_t->ne[2] << "," << result_t->ne[3] << "]"
+                                  << " -> out dims [B,H,T,D]=["
+                                  << out.dims[0] << "," << out.dims[1] << ","
+                                  << out.dims[2] << "," << out.dims[3] << "]"
+                                  << std::endl;
+
+                        std::vector<float> tmp_f32((size_t)total);
+                        const ggml_type out_type = result_t->type;
+                        if (out_type == GGML_TYPE_F32) {
+                            ggml_backend_tensor_get(
+                                result_t, tmp_f32.data(), 0,
+                                sizeof(float) * (size_t)total);
+                        } else if (out_type == GGML_TYPE_F16) {
+                            std::vector<ggml_fp16_t> tmp((size_t)total);
+                            ggml_backend_tensor_get(
+                                result_t, tmp.data(), 0,
+                                sizeof(ggml_fp16_t) * (size_t)total);
+                            ggml_fp16_to_fp32_row(tmp.data(), tmp_f32.data(), total);
+                        } else if (out_type == GGML_TYPE_BF16) {
+                            std::vector<uint16_t> tmp((size_t)total);
+                            ggml_backend_tensor_get(
+                                result_t, tmp.data(), 0,
+                                sizeof(uint16_t) * (size_t)total);
+                            for (int64_t i = 0; i < total; ++i) {
+                                tmp_f32[(size_t)i] = bf16_bits_to_float(tmp[(size_t)i]);
+                            }
+                        } else {
+                            ggml_backend_tensor_get(
+                                result_t, tmp_f32.data(), 0,
+                                sizeof(float) * (size_t)total);
+                        }
+
+                        out.data = std::make_unique<float[]>(total);
+                        const int64_t D = result_t->ne[0];
+                        const int64_t H = result_t->ne[1];
+                        const int64_t T = result_t->ne[2];
+                        const int64_t B = result_t->ne[3];
+                        for (int64_t b = 0; b < B; ++b) {
+                            for (int64_t h = 0; h < H; ++h) {
+                                for (int64_t t = 0; t < T; ++t) {
+                                    const int64_t base_src = (b * T * H + t * H + h) * D;
+                                    const int64_t base_dst = (b * H * T + h * T + t) * D;
+                                    std::memcpy(
+                                        out.data.get() + base_dst,
+                                        tmp_f32.data() + base_src,
+                                        (size_t)D * sizeof(float));
+                                }
+                            }
+                        }
+        
+                        ggml_backend_buffer_free(buf);  
+                        return out;  
+                    };  
+        
+                    result = run_flash_attn_typed(backend);  
+        
+                    if (!result.data && use_gpu) {  
+                        ggml_backend_t cpu_backend;  
+                        {  
+                            std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                            cpu_backend = matrix_backend_llama.ggml_backends.back();  
+                        }  
+                        result = run_flash_attn_typed(cpu_backend);  
+                    }  
+                }  
+                } else if (backend_type == "torch") {
+                    bool torch_gpu_available = false;
+                    #ifdef USE_CUDA
+                    torch_gpu_available = torch::cuda::is_available();
+                    #endif
+
+                    if (use_gpu && !torch_gpu_available) {
+                        std::cout << "⚠️  GPU requested but unavailable. Using CPU." << std::endl;
+                    }
+
+                    auto to_torch_4d = [](const matrix_shard_object& obj) -> torch::Tensor {
+                        if (!obj.data) {
+                            throw std::runtime_error("Missing matrix data for torch flash_attn input: " + obj.base_file_name);
+                        }
+                        std::vector<int64_t> sizes = {obj.batchA, obj.depthA, obj.rows_A, obj.cols_A};
+                        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+                        return torch::from_blob((void*)obj.data->data(), sizes, options).clone();
+                    };
+
+                    torch::Tensor Q = to_torch_4d(matrixQ);
+                    torch::Tensor K = to_torch_4d(matrixK);
+                    torch::Tensor V = to_torch_4d(matrixV);
+
+                    if (transposeQ) Q = Q.transpose(-2, -1).contiguous();
+                    if (transposeK) K = K.transpose(-2, -1).contiguous();
+                    if (transposeV) V = V.transpose(-2, -1).contiguous();
+
+                    const int64_t Bq = Q.size(0);
+                    const int64_t Hq = Q.size(1);
+                    const int64_t Tq = Q.size(2);
+                    const int64_t Dq = Q.size(3);
+
+                    const int64_t Tk = K.size(2);
+                    const int64_t Dk = K.size(3);
+
+                    const int64_t Tv = V.size(2);
+
+                    if (Dq != Dk) {
+                        throw std::runtime_error("flash_attn torch: Q/K head dim mismatch");
+                    }
+                    if (Tk != Tv) {
+                        throw std::runtime_error("flash_attn torch: K/V sequence mismatch");
+                    }
+
+                    auto repeat_interleave_or_throw = [&](torch::Tensor t, int64_t target, int64_t dim, const char* label) -> torch::Tensor {
+                        const int64_t current = t.size(dim);
+                        if (current == target) return t;
+                        if (current <= 0 || target % current != 0) {
+                            throw std::runtime_error(std::string("flash_attn torch: cannot broadcast ") + label);
+                        }
+                        const int64_t rep = target / current;
+                        return t.repeat_interleave(rep, dim);
+                    };
+                    auto repeat_tile_or_throw = [&](torch::Tensor t, int64_t target, int64_t dim, const char* label) -> torch::Tensor {
+                        const int64_t current = t.size(dim);
+                        if (current == target) return t;
+                        if (current <= 0 || target % current != 0) {
+                            throw std::runtime_error(std::string("flash_attn torch: cannot broadcast ") + label);
+                        }
+                        std::vector<int64_t> reps(t.dim(), 1);
+                        reps[(size_t)dim] = target / current;
+                        return t.repeat(reps);
+                    };
+
+                    // Match GGML broadcast semantics (grouped repeat).
+                    K = repeat_interleave_or_throw(K, Bq, 0, "K batch");
+                    K = repeat_interleave_or_throw(K, Hq, 1, "K heads");
+                    V = repeat_interleave_or_throw(V, Bq, 0, "V batch");
+                    V = repeat_interleave_or_throw(V, Hq, 1, "V heads");
+
+                    torch::Tensor attn_mask;
+                    if (has_mask) {
+                        const int64_t expected_cols = Tk; // n_kv
+                        const int64_t expected_rows = Tq; // n_q
+                        const bool dims_ok = (colsM == expected_cols && rowsM == expected_rows);
+                        const bool dims_swapped = (colsM == expected_rows && rowsM == expected_cols);
+                        if (!dims_ok && !dims_swapped) {
+                            throw std::runtime_error("Mask dims do not match Q/K (expected [n_kv,n_q] or [n_q,n_kv])");
+                        }
+
+                        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+                        torch::Tensor mask = torch::from_blob((void*)mask_ptr, {batchM, depthM, rowsM, colsM}, options).clone();
+                        if (dims_swapped && !dims_ok) {
+                            mask = mask.transpose(-2, -1).contiguous();
+                        }
+
+                        if (mask.size(2) != expected_rows || mask.size(3) != expected_cols) {
+                            throw std::runtime_error("Mask dims after transpose do not match Q/K");
+                        }
+
+                        // Broadcast mask across depth/batch (tiled repeat).
+                        mask = repeat_tile_or_throw(mask, Hq, 1, "mask depth");
+                        mask = repeat_tile_or_throw(mask, Bq, 0, "mask batch");
+
+                        if (max_bias > 0.0f) {
+                            int64_t n_head = Hq;
+                            int64_t n_head_log2 = 1;
+                            while ((n_head_log2 << 1) <= n_head) {
+                                n_head_log2 <<= 1;
+                            }
+                            const float m0 = std::pow(2.0f, -(max_bias) / (float)n_head_log2);
+                            const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+                            std::vector<float> slopes((size_t)n_head, 1.0f);
+                            for (int64_t h = 0; h < n_head; ++h) {
+                                if (h < n_head_log2) {
+                                    slopes[(size_t)h] = std::pow(m0, (float)(h + 1));
+                                } else {
+                                    const float expn = (float)(2 * (h - n_head_log2) + 1);
+                                    slopes[(size_t)h] = std::pow(m1, expn);
+                                }
+                            }
+                            torch::Tensor slope_t = torch::from_blob(slopes.data(), {n_head}, options).clone();
+                            slope_t = slope_t.view({1, n_head, 1, 1});
+                            mask = mask * slope_t;
+                        }
+
+                        attn_mask = mask;
+                    } else if (max_bias > 0.0f) {
+                        throw std::runtime_error("flash_attn torch: max_bias requires mask");
+                    }
+
+                    torch::Device device = torch::kCPU;
+                    if (use_gpu && torch_gpu_available) {
+                        device = torch::Device(torch::kCUDA, gpu_id);
+                    }
+
+                    torch::ScalarType desired_dtype = torch::kFloat32;
+                    if (output_dtype_tag == -2) {
+                        desired_dtype = torch::kFloat16;
+                    } else if (output_dtype_tag == -3) {
+                        desired_dtype = torch::kBFloat16;
+                    }
+                    if (device.is_cpu()) {
+                        // CPU kernels are most reliable in float32.
+                        desired_dtype = torch::kFloat32;
+                    }
+
+                    Q = Q.to(device);
+                    K = K.to(device);
+                    V = V.to(device);
+                    if (Q.scalar_type() != desired_dtype) Q = Q.to(desired_dtype);
+                    if (K.scalar_type() != desired_dtype) K = K.to(desired_dtype);
+                    if (V.scalar_type() != desired_dtype) V = V.to(desired_dtype);
+
+                    if (attn_mask.defined()) {
+                        attn_mask = attn_mask.to(device);
+                    }
+
+                    float scale_use = scale;
+                    if (scale_use <= 0.0f) {
+                        scale_use = 1.0f / std::sqrt((float)std::max<int64_t>(1, Dq));
+                    }
+                    if (logit_softcap != 0.0f) {
+                        scale_use /= logit_softcap;
+                    }
+
+                    torch::Tensor out;
+                    if (logit_softcap == 0.0f && max_bias == 0.0f && !attn_mask.defined()) {
+                        const c10::optional<torch::Tensor> mask_opt =
+                            attn_mask.defined() ? c10::optional<torch::Tensor>(attn_mask) : c10::nullopt;
+                        out = at::scaled_dot_product_attention(
+                            Q, K, V,
+                            mask_opt,
+                            0.0,
+                            false,
+                            scale_use
+                        );
+                    } else {
+                        torch::Tensor Qm = Q;
+                        torch::Tensor Km = K;
+                        torch::Tensor Vm = V;
+                        torch::Tensor Mm = attn_mask;
+                        if (Q.scalar_type() != torch::kFloat32) Qm = Q.to(torch::kFloat32);
+                        if (K.scalar_type() != torch::kFloat32) Km = K.to(torch::kFloat32);
+                        if (V.scalar_type() != torch::kFloat32) Vm = V.to(torch::kFloat32);
+                        if (Mm.defined() && Mm.scalar_type() != torch::kFloat32) Mm = Mm.to(torch::kFloat32);
+
+                        torch::Tensor logits = torch::matmul(Qm, Km.transpose(-2, -1)) * scale_use;
+                        if (logit_softcap != 0.0f) {
+                            logits = logit_softcap * torch::tanh(logits);
+                        }
+                        if (Mm.defined()) {
+                            logits = logits + Mm;
+                        }
+
+                        torch::Tensor probs = torch::softmax(logits, -1);
+                        out = torch::matmul(probs, Vm);
+                    }
+                    out = out.contiguous().to(torch::kCPU);
+                    if (out.scalar_type() != torch::kFloat32) {
+                        out = out.to(torch::kFloat32);
+                    }
+
+                    const int64_t total = out.numel();
+                    result.dims[0] = (int)out.size(0);
+                    result.dims[1] = (int)out.size(1);
+                    result.dims[2] = (int)out.size(2);
+                    result.dims[3] = (int)out.size(3);
+                    result.data = std::make_unique<float[]>((size_t)total);
+                    std::memcpy(result.data.get(), out.data_ptr<float>(), (size_t)total * sizeof(float));
+                }
+
+                if (!result.data) {  
+                    throw std::runtime_error("flash_attn_ext computation failed");  
+                }  
+
+                // Store result in shard list for future ops  
+                store_matrix_result_to_shard_list(output_filename, result, output_dtype_tag);  
+        
+                if (send_back != 0) {  
+                    send_back_file(output_filename, output_filename, result, send_back, backend_type, output_dtype_tag);  
+                }  
+
+                op_success = true;  
+            }  
+            catch (const std::exception& ex) {  
+                std::cerr << "Error in flash_atten_openartion: " << ex.what() << std::endl;  
+                op_success = false;  
+            }  
+        
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
+                    return op_success;
+
+        }
+        
+        bool rope_openartion(
+            const std::string& backend_type,
+            const matrix_shard_object& matrixA,
+            bool transposeA,
+            bool use_gpu,
+            int gpu_id,
+            int send_back,
+            const std::string& op_type,  // "rope", "rope_ext", "rope_multi"
+            const RoPEParams* rope_base_params,
+            const RoPEExtParams* rope_ext_params,
+            const RoPEMultiParams* rope_multi_params,
+            int shard_index_override
+        )
+        {
+            bool op_success = false;
+
+            try {
+                if (backend_type != "llama") {
+                    throw std::runtime_error("RoPE only implemented for llama backend");
+                }
+
+                if (!matrixA.data) {
+                    throw std::runtime_error("Missing matrix data for RoPE operation");
+                }
+
+                // ---------------- Validate exactly ONE params ----------------
+                const int param_count =
+                    (rope_base_params  != nullptr) +
+                    (rope_ext_params   != nullptr) +
+                    (rope_multi_params != nullptr);
+
+                if (param_count != 1) {
+                    throw std::runtime_error("Exactly ONE RoPE parameter struct must be provided");
+                }
+
+                // ---------------- Select backend ----------------
+                ggml_backend_t backend;
+                {
+                    std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                    backend = (use_gpu && gpu_id >= 0 &&
+                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+                        ? matrix_backend_llama.ggml_backends[gpu_id]
+                        : matrix_backend_llama.ggml_backends.back();
+                }
+
+                // ---------------- Prepare input ----------------
+                const float* a_ptr = matrixA.data->data();
+                int colsA  = matrixA.cols_A;
+                int rowsA  = matrixA.rows_A;
+                int depthA = matrixA.depthA;
+                int batchA = matrixA.batchA;
+
+                std::unique_ptr<float[]> a_tmp;
+
+                if (transposeA) {
+                    a_tmp = (depthA > 1 || batchA > 1)
+                        ? matrix_backend_llama.transpose_4d(
+                            const_cast<float*>(a_ptr), batchA, depthA, rowsA, colsA)
+                        : matrix_backend_llama.transpose_2d(
+                            const_cast<float*>(a_ptr), rowsA, colsA);
+                    a_ptr = a_tmp.get();
+                    std::swap(rowsA, colsA);
+                }
+
+                int dimsA[4] = { colsA, rowsA, depthA, batchA };
+
+                // ---------------- Execute ----------------
+                void* rope_params = nullptr;
+                if (rope_base_params)  rope_params = (void*)rope_base_params;
+                if (rope_ext_params)   rope_params = (void*)rope_ext_params;
+                if (rope_multi_params) rope_params = (void*)rope_multi_params;
+
+                if (op_type != "rope" && op_type != "rope_ext" && op_type != "rope_multi") {
+                    throw std::runtime_error("Invalid RoPE op_type: " + op_type);
+                }
+
+                MatrixResult result = matrix_backend_llama.matrix_op_nd(
+                    const_cast<float*>(a_ptr),
+                    dimsA,
+                    nullptr,
+                    nullptr,
+                    backend,
+                    op_type,
+                    rope_params
+                );
+
+                // ---------------- CPU fallback ----------------
+                if (!result.data && use_gpu) {
+                    ggml_backend_t cpu_backend;
+                    {
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                        cpu_backend = matrix_backend_llama.ggml_backends.back();
+                    }
+
+                    result = matrix_backend_llama.matrix_op_nd(
+                        const_cast<float*>(a_ptr),
+                        dimsA,
+                        nullptr,
+                        nullptr,
+                        cpu_backend,
+                        op_type,
+                        rope_params
+                    );
+                }
+
+                if (!result.data) {
+                    throw std::runtime_error("RoPE computation failed");
+                }
+
+                // ---------------- Output filename (SAFE) ----------------
+                std::string output_filename = matrixA.base_file_name;
+
+                int shard_num = shard_index_override;
+                if (shard_num < 0) {
+                    std::lock_guard<std::mutex> lock(output_shard_mutex);
+                    shard_num = output_shard_counters[output_filename]++;
+                }
+
+                // If the original filename does not already contain a shard suffix, add it
+                if (output_filename.find("_shard_") == std::string::npos) {
+                    output_filename += "_shard_" + std::to_string(shard_num) + ".bin";
+                }
+
+                // ---------------- Store / send ----------------
+                store_matrix_result_to_shard_list(
+                    output_filename,
+                    result,
+                    matrixA.output_dtype_tag
+                );
+
+                if (send_back != 0) {
+                    send_back_file(
+                        output_filename,
+                        output_filename,
+                        result,
+                        send_back,
+                        "llama",
+                        matrixA.output_dtype_tag
+                    );
+                }
+
+                op_success = true;
+
+            }
+            catch (const std::exception& ex) {
+                std::cerr << "Error in rope_openartion: " << ex.what() << std::endl;
+                op_success = false;
+            }
+
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
+
+            return op_success;
+        }
+
+        bool reshape_matrix(  
+            const std::string& backend_type,  
+            const matrix_shard_object& matrixA,  
+            bool transposeA,  
+            bool use_gpu,  
+            int gpu_id,  
+            int send_back,  
+            const int output_dims[4],  
+            int shard_index_override)  
+        {  
+            bool op_success = false;  
+        
+            try {  
+                if (backend_type != "llama") {  
+                    throw std::runtime_error("Reshape only implemented for llama backend");  
+                }  
+        
+                if (!matrixA.data) {  
+                    throw std::runtime_error("Missing matrix data for reshape operation");  
+                }  
+        
+                // ---------------- Validate output dimensions (torch order) ----------------  
+                int inferred = 0;
+                for (int i = 0; i < 4; i++) {  
+                    if (output_dims[i] == 0) {  
+                        throw std::runtime_error("Invalid output dimension at index " + std::to_string(i));  
+                    }  
+                    if (output_dims[i] < 0) {
+                        inferred += 1;
+                    }
+                }  
+                if (inferred > 1) {
+                    throw std::runtime_error("Only one output dimension can be inferred (-1)");
+                }
+        
+                // ---------------- Select backend ----------------  
+                ggml_backend_t backend;  
+                {  
+                    std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                    backend = (use_gpu && gpu_id >= 0 &&  
+                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())  
+                        ? matrix_backend_llama.ggml_backends[gpu_id]  
+                        : matrix_backend_llama.ggml_backends.back();  
+                }  
+        
+                // ---------------- Prepare input ----------------  
+                const float* a_ptr = matrixA.data->data();  
+                int colsA  = matrixA.cols_A;  
+                int rowsA  = matrixA.rows_A;  
+                int depthA = matrixA.depthA;  
+                int batchA = matrixA.batchA;  
+        
+                std::unique_ptr<float[]> a_tmp;  
+        
+                if (transposeA) {  
+                    a_tmp = (depthA > 1 || batchA > 1)  
+                        ? matrix_backend_llama.transpose_4d(  
+                            const_cast<float*>(a_ptr), batchA, depthA, rowsA, colsA)  
+                        : matrix_backend_llama.transpose_2d(  
+                            const_cast<float*>(a_ptr), rowsA, colsA);  
+                    a_ptr = a_tmp.get();  
+                    std::swap(rowsA, colsA);  
+                }  
+        
+                int input_dims[4] = { colsA, rowsA, depthA, batchA };  
+
+                // Convert output dims from torch order (batch, depth, rows, cols)
+                // to ggml order (cols, rows, depth, batch)
+                int output_dims_ggml[4] = {
+                    output_dims[3],
+                    output_dims[2],
+                    output_dims[1],
+                    output_dims[0]
+                };
+        
+                // ---------------- Execute reshape ----------------  
+                MatrixResult result = matrix_backend_llama.reshape_nd(  
+                    const_cast<float*>(a_ptr),  
+                    input_dims,  
+                    output_dims_ggml,  
+                    backend  
+                );  
+        
+                // ---------------- CPU fallback ----------------  
+                if (!result.data && use_gpu) {  
+                    ggml_backend_t cpu_backend;  
+                    {  
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                        cpu_backend = matrix_backend_llama.ggml_backends.back();  
+                    }  
+        
+                    result = matrix_backend_llama.reshape_nd(  
+                        const_cast<float*>(a_ptr),  
+                        input_dims,  
+                        output_dims_ggml,  
+                        cpu_backend  
+                    );  
+                }  
+        
+                if (!result.data) {  
+                    throw std::runtime_error("Reshape computation failed");  
+                }  
+        
+                // ---------------- Output filename (SAFE) ----------------  
+                std::string output_filename = matrixA.base_file_name;  
+        
+                int shard_num = shard_index_override;  
+                if (shard_num < 0) {  
+                    std::lock_guard<std::mutex> lock(output_shard_mutex);  
+                    shard_num = output_shard_counters[output_filename]++;  
+                }  
+        
+                // If the original filename does not already contain a shard suffix, add it  
+                if (output_filename.find("_shard_") == std::string::npos) {  
+                    output_filename += "_shard_" + std::to_string(shard_num) + ".bin";  
+                }  
+        
+                // ---------------- Store / send ----------------  
+                store_matrix_result_to_shard_list(  
+                    output_filename,  
+                    result,  
+                    matrixA.output_dtype_tag  
+                );  
+        
+                if (send_back != 0) {  
+                    send_back_file(  
+                        output_filename,  
+                        output_filename,  
+                        result,  
+                        send_back,  
+                        "llama",  
+                        matrixA.output_dtype_tag  
+                    );  
+                }  
+        
+                op_success = true;  
+        
+            }  
+            catch (const std::exception& ex) {  
+                std::cerr << "Error in reshape_matrix: " << ex.what() << std::endl;  
+                op_success = false;  
+            }  
+        
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}  
+        
+            return op_success;  
+        }
+
+        bool repeat_matrix(  
+            const std::string& backend_type,  
+            const matrix_shard_object& matrixA,  
+            bool transposeA,  
+            bool use_gpu,  
+            int gpu_id,  
+            int send_back,  
+            const int repeat_dims[4],  
+            int shard_index_override)  
+        {  
+            bool op_success = false;  
+        
+            try {  
+                if (backend_type != "llama") {  
+                    throw std::runtime_error("Repeat only implemented for llama backend");  
+                }  
+        
+                if (!matrixA.data) {  
+                    throw std::runtime_error("Missing matrix data for repeat operation");  
+                }  
+        
+                // ---------------- Validate repeat dimensions ----------------  
+                for (int i = 0; i < 4; i++) {  
+                    if (repeat_dims[i] <= 0) {  
+                        throw std::runtime_error("Invalid repeat dimension at index " + std::to_string(i));  
+                    }  
+                }  
+        
+                // ---------------- Select backend ----------------  
+                ggml_backend_t backend;  
+                {  
+                    std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                    backend = (use_gpu && gpu_id >= 0 &&  
+                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())  
+                        ? matrix_backend_llama.ggml_backends[gpu_id]  
+                        : matrix_backend_llama.ggml_backends.back();  
+                }  
+        
+                // ---------------- Prepare input ----------------  
+                const float* a_ptr = matrixA.data->data();  
+                int colsA  = matrixA.cols_A;  
+                int rowsA  = matrixA.rows_A;  
+                int depthA = matrixA.depthA;  
+                int batchA = matrixA.batchA;  
+        
+                std::unique_ptr<float[]> a_tmp;  
+        
+                if (transposeA) {  
+                    a_tmp = (depthA > 1 || batchA > 1)  
+                        ? matrix_backend_llama.transpose_4d(  
+                            const_cast<float*>(a_ptr), batchA, depthA, rowsA, colsA)  
+                        : matrix_backend_llama.transpose_2d(  
+                            const_cast<float*>(a_ptr), rowsA, colsA);  
+                    a_ptr = a_tmp.get();  
+                    std::swap(rowsA, colsA);  
+                }  
+        
+                int input_dims[4] = { colsA, rowsA, depthA, batchA };  
+        
+                // ---------------- Execute repeat ----------------  
+                // repeat_dims are provided in torch order (batch, depth, rows, cols)
+                // Convert to ggml order (cols, rows, depth, batch)
+                int repeat_dims_ggml[4] = {
+                    repeat_dims[3],
+                    repeat_dims[2],
+                    repeat_dims[1],
+                    repeat_dims[0]
+                };
+
+                MatrixResult result = matrix_backend_llama.repeat_nd(  
+                    const_cast<float*>(a_ptr),  
+                    input_dims,  
+                    repeat_dims_ggml,  
+                    backend  
+                );  
+        
+                // ---------------- CPU fallback ----------------  
+                if (!result.data && use_gpu) {  
+                    ggml_backend_t cpu_backend;  
+                    {  
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);  
+                        cpu_backend = matrix_backend_llama.ggml_backends.back();  
+                    }  
+        
+                    result = matrix_backend_llama.repeat_nd(  
+                        const_cast<float*>(a_ptr),  
+                        input_dims,  
+                        repeat_dims_ggml,  
+                        cpu_backend  
+                    );  
+                }  
+        
+                if (!result.data) {  
+                    throw std::runtime_error("Repeat computation failed");  
+                }  
+        
+                // ---------------- Output filename (SAFE) ----------------  
+                std::string output_filename = matrixA.base_file_name;  
+        
+                int shard_num = shard_index_override;  
+                if (shard_num < 0) {  
+                    std::lock_guard<std::mutex> lock(output_shard_mutex);  
+                    shard_num = output_shard_counters[output_filename]++;  
+                }  
+        
+                // If the original filename does not already contain a shard suffix, add it  
+                if (output_filename.find("_shard_") == std::string::npos) {  
+                    output_filename += "_shard_" + std::to_string(shard_num) + ".bin";  
+                }  
+        
+                // ---------------- Store / send ----------------  
+                store_matrix_result_to_shard_list(  
+                    output_filename,  
+                    result,  
+                    matrixA.output_dtype_tag  
+                );  
+        
+                if (send_back != 0) {  
+                    send_back_file(  
+                        output_filename,  
+                        output_filename,  
+                        result,  
+                        send_back,  
+                        "llama",  
+                        matrixA.output_dtype_tag  
+                    );  
+                }  
+        
+                op_success = true;  
+        
+            }  
+            catch (const std::exception& ex) {  
+                std::cerr << "Error in repeat_matrix: " << ex.what() << std::endl;  
+                op_success = false;  
+            }  
+        
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}  
+        
+            return op_success;  
+        }
 };
 
 int main()
@@ -3359,133 +5675,3 @@ int main()
     llama_zmq_server server;
     server.run_server();
 }
-
-/*
-int main()
-{
-    const char* path_to_A = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/test_2d_a.bin";
-    const char* path_to_B = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/test_2d_a.bin";
-
-    llama_zmq_server server;
-    /*
-    // ==========================================
-    // Torch timing
-    // ==========================================
-    auto torch_start = std::chrono::high_resolution_clock::now();
-
-    server.matrix_operation_torch(
-        path_to_A,
-        false,          // transposeA
-        path_to_B,
-        true,           // transposeB
-        false,          // use_gpu
-        0,              // gpu_id
-        false,          // send_back
-        "mul"
-    );
-
-    auto torch_end = std::chrono::high_resolution_clock::now();
-    auto torch_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            torch_end - torch_start
-        ).count();
-
-    std::cout << "🔥 Torch took "
-              << torch_us << " µs ("
-              << torch_us / 1e6 << " s)\n";
-
-
-    // ==========================================
-    // GGML timing per backend
-    // ==========================================
-    for (int gpu_id = 0; gpu_id <= 2; gpu_id++) {
-
-        auto start = std::chrono::high_resolution_clock::now();
-
-        server.matrix_operation_llama(
-            path_to_A,
-            true,           // transposeA
-            path_to_B,
-            true,           // transposeB
-            true,           // use_gpu
-            gpu_id,         // gpu_id
-            false,          // send_back
-            "mul",
-            2               // dim
-        );
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                end - start
-            ).count();
-
-        std::cout << "⚙️  GGML gpu_id " << gpu_id
-                  << " took " << us << " µs ("
-                  << us / 1e6 << " s)\n";
-    }
-
-}
-*/
-
-/*
-int main()
-{
-    const char* path_to_B_shard_1 = "matrix_shards/test_2d_a_shard_1.bin";
-    const char* path_to_A        = "matrix_shards/test_2d_a.bin";
-    const char* path_to_B        = "matrix_shards/test_2d_a.bin";
-
-    llama_matrix_backend server;
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        std::unique_ptr<float[]> matrix_B_shard_1 = nullptr;
-
-        int rows_A, cols_A;
-        int rows_B, cols_B;
-        int rows_B_shard_1, cols_B_shard_1;
-
-        int depthA = 0, batchA = 0;
-        int depthB = 0, batchB = 0;
-        int depthB_s = 0, batchB_s = 0;
-
-        matrix_A = load_matrix_bin(path_to_A, rows_A, cols_A, batchA, depthA);
-        matrix_B = load_matrix_bin(path_to_B, rows_B, cols_B, batchB, depthB);
-        matrix_B_shard_1 = load_matrix_bin(
-            path_to_B_shard_1,
-            rows_B_shard_1, cols_B_shard_1,
-            batchB_s, depthB_s
-        );
-
-        // GGML dims: [cols, rows, depth, batch]
-        int dims2d_a[4] = { cols_A, rows_A, 1, 1 };
-        int dims2d_b[4] = { cols_B, rows_B, 1, 1 };
-        int dims2d_b_shard_1[4] = { cols_B_shard_1, rows_B_shard_1, 1, 1 };
-
-        std::cout << "Original A: " << rows_A << "x" << cols_A << std::endl;
-        std::cout << "Original B (full): " << rows_B << "x" << cols_B << std::endl;
-        std::cout << "Original B (shard_1): " << rows_B_shard_1 << "x" << cols_B_shard_1 << std::endl;
-
-        //print_bin_from_torch("matrix_shards/test_2d_a_shard_1.bin",10,10);
-        //print_bin_from_torch("matrix_shards/test_2d_a.bin",10,10);
-
-
-
-        // ---- A @ B (shard_1) ----
-        {
-            MatrixResult r = server.matrix_op_nd(
-                matrix_A.get(), dims2d_a,
-                matrix_B_shard_1.get(), dims2d_b_shard_1,
-                server.ggml_backends[0], "mul"
-            );
-            save_matrix_bin("matrix_shards/shard_AB_out.bin",r);
-            torch::Tensor shard_AB = load_matrix_bin_as_torch_view("matrix_shards/shard_AB_out.bin");
-            std::cout << "\nSHARD A@B flat:\n";
-            print_tensor_start_flat(shard_AB, "fuck" ,40);
-        }
-        
-    }
-
-    return 0;
-}
-*/

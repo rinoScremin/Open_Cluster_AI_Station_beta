@@ -9,7 +9,10 @@ import mmap
 import math
 
 def check_combined_result_values(c_ref_path, combined):
-    c_ref = torch.load(c_ref_path)
+    if torch.is_tensor(c_ref_path) == False:
+        c_ref = torch.load(c_ref_path)
+    else:
+        c_ref = c_ref_path
     if c_ref.shape != combined.shape:
         print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
         return
@@ -112,6 +115,8 @@ class cluster_zmq:
         if not self.local_project_dir.endswith(os.sep):
             self.local_project_dir += os.sep
         
+        self.local_DISK_folder = self.local_project_dir + self.local_DISK_folder
+
         print(f"   Local Paths:")
         print(f"     - Disk Folder: {self.local_DISK_folder}")
         print(f"     - Project Dir: {self.local_project_dir}")
@@ -127,6 +132,8 @@ class cluster_zmq:
         if not self.remote_project_dir.endswith(os.sep):
             self.remote_project_dir += os.sep
         
+        self.remote_DISK_folder = self.remote_project_dir + self.remote_DISK_folder
+
         print(f"   Remote Paths:")
         print(f"     - Disk Folder: {self.remote_DISK_folder}")
         print(f"     - Project Dir: {self.remote_project_dir}")
@@ -621,9 +628,9 @@ class cluster_matrix:
         auto_set_up=None,
     ):
         
-        print("=" * 70)
+        #print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
-        print("=" * 70)
+        #print("=" * 70)
 
         # =============== NODE CONFIGURATION VALIDATION ===============
         # Check consistency of the node configuration
@@ -701,7 +708,7 @@ class cluster_matrix:
         self.ack_receiver_socket = cluster_zmq_object.ack_receiver_socket
         
         # =============== FOLDER PATH CONFIGURATION ===============
-        print("\n📁 CONFIGURING STORAGE PATHS...")
+        #print("\n📁 CONFIGURING STORAGE PATHS...")
         
         # Local paths (head node)
         self.local_DISK_folder = cluster_zmq_object.local_DISK_folder
@@ -719,10 +726,10 @@ class cluster_matrix:
         self.conda_env_dir = cluster_zmq_object.conda_env_dir
         self.python_path = cluster_zmq_object.python_path
 
-        print(f"✅ Using Python path: {self.python_path}")
+        #print(f"✅ Using Python path: {self.python_path}")
 
         # =============== INSTANCE VARIABLE INITIALIZATION ===============
-        print("\n📊 INITIALIZING INSTANCE VARIABLES...")
+        #print("\n📊 INITIALIZING INSTANCE VARIABLES...")
         
         self.matrix_file_path = matrix_file_path
         # Store auto setup mode so load/save methods can branch (e.g. load vs loadC, save vs saveC).
@@ -735,6 +742,7 @@ class cluster_matrix:
         self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
         self.split_matrix = split_matrix
         self.OG_matrix_shape = []
+        self.node_matrices_shapes_list = None
         self.matrix_labeling= matrix_labeling
 
         # Extract matrix name from file path
@@ -744,7 +752,7 @@ class cluster_matrix:
             matrix_file_path_split = matrix_file_path.split('/')
             self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
             print(f"   Matrix Name: {self.matrix_name}")
-            print(f"   Split Matrix: {split_matrix}")
+            #print(f"   Split Matrix: {split_matrix}")
             print(f"   Dimension: {dim}")
         
         # If no backend specified, default to 'llama' for all nodes
@@ -759,7 +767,6 @@ class cluster_matrix:
         
         # =============== MATRIX DISTRIBUTION LOGIC ===============
         # auto_set_up format: [system_id, "save"/"saveC"/"load"/"loadC"/"loadG"]
-
         if len(auto_set_up) == 2:
             mode = auto_set_up[1]
             is_save = mode in ("save", "saveC")
@@ -909,39 +916,96 @@ class cluster_matrix:
         raise ValueError(f"Unknown matrix_labeling={self.matrix_labeling!r} for System 2 grid")
 
     def convert_to_cluster_matrix_shards(self):
-        if torch.is_tensor(self.matrix_file_path):
-            full_matrix = self.matrix_file_path
+        matrix_path = self.matrix_file_path
+        if torch.is_tensor(matrix_path):
+            full_matrix = matrix_path
         else:
-        # Load full matrix
-            full_matrix = torch.load(self.matrix_file_path)
+            # Load full matrix
+            full_matrix = torch.load(matrix_path)
 
-        total_rows = full_matrix.size(self.dim)  # typically dim=0
+        dim = int(self.dim)
+        total_rows = int(full_matrix.size(dim))  # typically dim=0
         self.node_matrices = []
 
+        node_percentages = getattr(self, "node_percentages", None)
+
         # Convert percentages to row counts
-        if hasattr(self, 'node_percentages') and self.node_percentages:
-            total_percentage = sum(self.node_percentages)
+        if node_percentages:
+            total_percentage = sum(node_percentages)
             if abs(total_percentage - 1.0) > 1e-6:
                 raise ValueError(f"Node percentages must sum to 1. Got {total_percentage}")
-            rows_per_node = [int(total_rows * p) for p in self.node_percentages]
+            percentages_np = np.asarray(node_percentages, dtype=np.float64)
+            rows_per_node = np.trunc(percentages_np * total_rows).astype(np.int64)
             # Adjust for rounding error
-            diff = total_rows - sum(rows_per_node)
+            diff = total_rows - int(rows_per_node.sum())
             if diff != 0:
                 rows_per_node[-1] += diff
+            rows_per_node = rows_per_node.tolist()
         else:
             # Default: even split among nodes
             num_nodes = len(self.node_IP_list)
             base_rows = total_rows // num_nodes
             rows_per_node = [base_rows] * num_nodes
-            rows_per_node[-1] += total_rows - sum(rows_per_node)
+            rows_per_node[-1] += total_rows - (base_rows * num_nodes)
+
+        # Vulkan FlashAttention constraint: K/V head size must be divisible by 8.
+        # Our "head size" corresponds to the split dimension when `dim == 1` for 2D matrices.
+        # Snap shard sizes to multiples of 8 when possible to avoid slow CPU fallback and instability.
+        align = 8
+        backends = getattr(self, "back_end_select_list", None) or []
+        cpu_gpu = getattr(self, "CPU_GPU_select_list", None) or []
+        want_llama = any(str(b).lower() == "llama" for b in backends)
+        want_gpu = any(cpu_gpu)
+        can_align = (
+            dim == 1
+            and want_llama
+            and want_gpu
+            and total_rows % align == 0
+            and (total_rows // align) >= len(rows_per_node)
+        )
+        if can_align and any((sz % align) != 0 for sz in rows_per_node):
+            total_units = total_rows // align
+            if node_percentages:
+                percentages_np = np.asarray(node_percentages, dtype=np.float64)
+            else:
+                n = len(rows_per_node)
+                percentages_np = np.full(n, 1.0 / n, dtype=np.float64)
+
+            ideal_units = percentages_np * total_units
+            units = np.floor(ideal_units).astype(np.int64)
+            units = np.maximum(units, 1)
+
+            # Rebalance units to match total_units (largest-deficit / largest-excess adjustment).
+            sum_units = int(units.sum())
+            if sum_units > total_units:
+                over = sum_units - total_units
+                for _ in range(over):
+                    if not np.any(units > 1):
+                        break
+                    score = np.where(units > 1, units - ideal_units, -np.inf)
+                    idx = int(score.argmax())
+                    units[idx] -= 1
+            elif sum_units < total_units:
+                add = total_units - sum_units
+                for _ in range(add):
+                    score = ideal_units - units
+                    idx = int(score.argmax())
+                    units[idx] += 1
+
+            aligned = units * align
+            if int(aligned.sum()) == total_rows and np.all(aligned > 0):
+                rows_per_node = aligned.astype(np.int64).tolist()
 
         # Slice the full matrix into shards
-        start_idx = 0
-        for node_idx, row_count in enumerate(rows_per_node):
-            end_idx = start_idx + row_count
-            shard = full_matrix.narrow(self.dim, start_idx, row_count).clone()
-            self.node_matrices.append(shard)
-            start_idx = end_idx
+        if any(sz == 0 for sz in rows_per_node):
+            starts = np.cumsum([0] + rows_per_node[:-1]).astype(np.int64)
+            self.node_matrices = [
+                full_matrix.narrow(dim, int(start), int(count)).clone()
+                for start, count in zip(starts, rows_per_node)
+            ]
+        else:
+            shards = full_matrix.split(rows_per_node, dim=dim)
+            self.node_matrices = [shard.clone() for shard in shards]
 
         #print(f"✅ Created {len(self.node_matrices)} shards according to node percentages")
         #for i, shard in enumerate(self.node_matrices):
@@ -968,7 +1032,7 @@ class cluster_matrix:
         mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "saveC"
         prefer_vram = (mode == "save")
         for shard_index, node_IP in enumerate(self.node_IP_list):
-            print(f"Processing shard {shard_index} for node {node_IP}")
+            #print(f"Processing shard {shard_index} for node {node_IP}")
             # Create filename for this shard
             save_name = f"{self.matrix_name}_shard_{shard_index}.bin"
             stream_name = f"VRAM|{save_name}" if prefer_vram else save_name
@@ -976,7 +1040,7 @@ class cluster_matrix:
             if node_IP == self.IP:
                 save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
                 
-                print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                #print(f"  Head node: Saving to DISK={save_file_path_DISK}")
                 
                 # Save tensor to binary file on disk (no /dev/shm)
                 self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_DISK)
@@ -987,11 +1051,11 @@ class cluster_matrix:
 
                 # Store the matrix name (used as key on each node's C++ server).
                 self.matrix_file_paths_list.append(save_name)
-                print(f"  Added matrix name to list: {save_name}")
+                #print(f"  Added matrix name to list: {save_name}")
                     
             # Handle shard for REMOTE NODE
             elif node_IP != self.IP:
-                print(f"  Remote node {node_IP}: Beginning distribution")
+                #print(f"  Remote node {node_IP}: Beginning distribution")
 
                 self.cluster_zmq_object.stream_matrix_binary(node_IP, self.node_matrices[shard_index], stream_name)
 
@@ -999,7 +1063,7 @@ class cluster_matrix:
 
                 # Store the matrix name (used as key on each node's C++ server).
                 self.matrix_file_paths_list.append(save_name)
-                print(f"  Added matrix name to list: {save_name}")
+                #print(f"  Added matrix name to list: {save_name}")
         return self.matrix_file_paths_list
 
     def save_distribute_full_matrix_bin(self):
@@ -1017,18 +1081,18 @@ class cluster_matrix:
         
         # Define local file paths
         save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-        print(f"Local path - DISK: {save_file_path_DISK}")
+        #print(f"Local path - DISK: {save_file_path_DISK}")
         
         # Load the full matrix from PyTorch file
         if torch.is_tensor(self.matrix_file_path):
             full_matrix = self.matrix_file_path
         else:
-            print(f"Loading matrix from: {self.matrix_file_path}")
+            #print(f"Loading matrix from: {self.matrix_file_path}")
             full_matrix = torch.load(self.matrix_file_path)
             print(f"Matrix loaded - Shape: {full_matrix.shape}")
         
         # Save to binary format locally
-        print("Saving to local storage...")
+        #print("Saving to local storage...")
         self.save_matrix_binary(full_matrix, save_file_path_DISK)
 
         # Track matrix name for each slot (no /dev/shm paths)
@@ -1037,11 +1101,11 @@ class cluster_matrix:
         # Get UNIQUE IPs (no duplicates)
         unique_node_IP_list = list(set(self.node_IP_list))
         
-        print(f"Streaming to {len(unique_node_IP_list)} unique node(s)...")
+        #print(f"Streaming to {len(unique_node_IP_list)} unique node(s)...")
         
         # Stream to each unique node (including head) so the C++ server caches it in memory.
         for node_ip in unique_node_IP_list:
-            print(f"Streaming to {node_ip}")
+            #print(f"Streaming to {node_ip}")
             self.cluster_zmq_object.stream_matrix_binary(node_ip, full_matrix, stream_name)
             self.cluster_zmq_object.wait_for_acks(1, save_name)
         print(f"Full matrix distribution completed")
@@ -1133,10 +1197,6 @@ class cluster_matrix:
             matrix: PyTorch tensor or numpy array to save
             filename: Path where the binary file will be saved
         """
-        verbose = os.environ.get("SAVE_MATRIX_BINARY_VERBOSE", "1") == "1"
-        if verbose:
-            print(f"Saving matrix to binary file: {filename}")
-
         parent = os.path.dirname(filename)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -1172,10 +1232,6 @@ class cluster_matrix:
                 raise ValueError(f"Unsupported tensor dtype for save_matrix_binary: {t.dtype}")
 
             shape = tuple(int(x) for x in t.shape)
-            if verbose:
-                print(f"Original shape: {tuple(matrix.shape)}")
-                print(f"Converted to 4D: {shape}")
-                print("Writing binary file...")
 
             with open(filename, "wb") as f:
                 f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
@@ -1201,10 +1257,6 @@ class cluster_matrix:
                 raise ValueError(f"Invalid array dimensionality: {arr.ndim}")
 
             shape = tuple(int(x) for x in arr.shape)
-            if verbose:
-                print(f"Original shape: {tuple(matrix.shape)}")
-                print(f"Converted to 4D: {shape}")
-                print("Writing binary file...")
 
             with open(filename, "wb") as f:
                 f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
@@ -1307,14 +1359,14 @@ class cluster_matrix:
             tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True))
     
         # Info  
-        print(f"✅ Loaded {filename}")  
+        #print(f"✅ Loaded {filename}")  
         print(f"  Original dims: {dims}")  
         print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel() * tensor_pt.element_size():,} bytes")
-        stats_max_elems = int(os.environ.get("CONVERT_BIN_STATS_MAX_ELEMS", "2000000"))
-        if tensor_pt.numel() <= stats_max_elems:
-            print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")
-        else:
-            print(f"  Data range: [skipped; numel={tensor_pt.numel():,} > {stats_max_elems:,}]")
+        #stats_max_elems = int(os.environ.get("CONVERT_BIN_STATS_MAX_ELEMS", "2000000"))
+        #if tensor_pt.numel() <= stats_max_elems:
+        #    print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")
+        #else:
+        #    print(f"  Data range: [skipped; numel={tensor_pt.numel():,} > {stats_max_elems:,}]")
     
         return tensor_pt
 
@@ -1361,7 +1413,7 @@ class cluster_matrix:
             print(f"Error loading matrix: {e}")
             return False
         
-        print(f"Matrix loaded successfully")
+        #print(f"Matrix loaded successfully")
         return True
 
     def load_cluster_matrix_shards(self):
@@ -1403,7 +1455,7 @@ class cluster_matrix:
             "ACK_load_matrix_shard_object_list_complete",
         )
 
-        print("\nMatrix shard loading complete")
+        #print("\nMatrix shard loading complete")
         return True
  
     def load_cluster_matrixA_grid(self):
@@ -1641,11 +1693,11 @@ class cluster_matrix:
             Base name of the result file(s)
         """
         
-        print(f"\n{'='*60}")
-        print(f"🚀 STARTING CLUSTER OPERATION")
-        print(f"{'='*60}")
-        print(f"Matrix A: {self.matrix_name}")
-        print(f"Matrix B: {cluster_matrixB.matrix_name}")
+        #print(f"\n{'='*60}")
+        #print(f"🚀 STARTING CLUSTER OPERATION")
+        #print(f"{'='*60}")
+        #print(f"Matrix A: {self.matrix_name}")
+        #print(f"Matrix B: {cluster_matrixB.matrix_name}")
         print(f"Operation: {operation}")
         print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
         node_IP_list_len = len(self.node_IP_list)
@@ -1657,7 +1709,7 @@ class cluster_matrix:
         # This ensures multiple GPUs on the same node get used properly
         node_gpu_counters = {}
         
-        print(f"\n📤 DISTRIBUTING OPERATIONS TO NODES")
+        #print(f"\n📤 DISTRIBUTING OPERATIONS TO NODES")
         
         # Send operation commands to each node for its assigned shard
         for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(zip(
@@ -1679,8 +1731,8 @@ class cluster_matrix:
                 node_gpu_counters[node_IP] += 1
             
             print(f"  Node: {node_IP}")
-            print(f"  Backend: {back_end_select}")
-            print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+            #print(f"  Backend: {back_end_select}")
+            #print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
             print(f"  Next GPU for this node will be: #{node_gpu_counters[node_IP]}")
             
             # Get file paths for both matrices
@@ -1701,7 +1753,7 @@ class cluster_matrix:
 
             TransposeA_str = str(local_TransposeA).lower()
             TransposeB_str = str(local_TransposeB).lower()
-            print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
+            #print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
             
             # ===== PREPARE SEND_BACK FLAG =====
             if node_IP_list_len == 1:
@@ -1741,10 +1793,10 @@ class cluster_matrix:
             )
     
             # ===== SEND COMMAND TO NODE =====
-            print(f"  Sending command to node...")
+            #print(f"  Sending command to node...")
             socket_eth = self.llama_socket_pool[node_IP]
             socket_eth.send_multipart([command.encode()])
-            print(f"  ✅ Command sent to node {node_IP}")
+            #print(f"  ✅ Command sent to node {node_IP}")
         
         # ===== WAIT FOR ACKS FROM ALL NODES =====
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
@@ -1818,3 +1870,705 @@ class cluster_matrix:
 
         # fallback (should rarely happen)
         return False
+
+    def ggml_cluster_single_matrix_operation(self, Transpose=False, operation='soft_max', send_back_result=False):
+        """
+        Perform a distributed GGML unary operation on all matrix shards.
+        Examples: soft_max, silu, gelu, gelu_quick, gelu_erf, rms_norm
+        """
+
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER GGML SINGLE-MATRIX OPERATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose: {Transpose}")
+        print(f"Send back result: {send_back_result}")
+
+        node_IP_list_len = len(self.node_IP_list)
+
+        # Track GPU usage per node (same logic as cluster_shard_operation)
+        node_gpu_counters = {}
+
+        print(f"\n📤 DISTRIBUTING UNARY OPS TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(zip(
+            self.node_IP_list,
+            self.CPU_GPU_select_list,
+            self.back_end_select_list,
+            self.matrix_file_paths_list
+        )):
+            print(f"\nProcessing shard {shard_index}:")
+
+            assert back_end_select == "llama", "ggml_cluster_single_matrix_operation only supports llama backend"
+
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: llama")
+            print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+
+            use_gpu_str = str(CPU_GPU_select).lower()
+            Transpose_str = str(Transpose).lower()
+
+            split_join_system = 1
+            # ===== SEND_BACK LOGIC (same system as shard op) =====
+            if node_IP_list_len == 1:
+                join_dim = self.dim
+                send_back = join_dim * 10 + 1
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                    split_join_system = 2
+            elif not send_back_result:
+                send_back = 0
+            else:
+                shard_count = node_IP_list_len
+                join_dim = self.dim
+                send_back = join_dim * 10 + shard_count
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                    split_join_system = 2
+
+            print(f"  Send back: {send_back}")
+
+            # ===== BUILD COMMAND =====
+            command = (
+                f"server_command=transformerOp "
+                f"{node_matrix} "
+                f"{Transpose_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back} "
+                f"{operation} "
+                f"{self.dim} "
+                f"{shard_index}"
+            )
+
+            print(f"  Sending command...")
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent")
+
+        # ===== WAIT FOR ACKS =====
+        expected_acks = node_IP_list_len
+        print(f"\n⏳ WAITING FOR ACKS ({expected_acks})")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_transformerOp_complete")
+        print(f"✅ CLUSTER GGML OP COMPLETE")
+
+        # ===== RESULT HANDLING =====
+        base_result_name = self.matrix_name
+
+        # Single node → always combined
+        if node_IP_list_len == 1:
+            return self.cluster_zmq_object.wait_for_combined_pt(f"{base_result_name}_shard_0.bin")
+
+        # Multi-node + combine
+        if send_back != 0:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        result = cluster_matrix(base_result_name, 
+                                cluster_zmq_object=self.cluster_zmq_object, 
+                                CPU_GPU_select_list=self.CPU_GPU_select_list, 
+                                node_percentages=self.node_percentages,
+                                back_end_select_list=self.back_end_select_list,
+                                split_matrix=self.split_matrix,
+                                dim=self.dim, 
+                                auto_set_up=[split_join_system, "load"])
+
+        return result
+
+    def cluster_flash_attn(
+            self,                      # self == Q
+            cluster_matrixK,           # K
+            cluster_matrixV,           # V
+            TransposeQ=False,
+            TransposeK=False,
+            TransposeV=False,
+            send_back_result=False,    # default: keep distributed
+            operation='flash_attn_ext',
+            extra_param_value=None,    # numeric value for extra param (scale, etc.)
+            mask=None                  # optional causal mask (torch.Tensor or cluster_matrix)
+        ):
+        """
+        Perform a distributed FlashAttention operation across the cluster.
+
+        Rules:
+        1. Q/K/V already in correct layout.
+        2. No backend transpose hacks allowed here.
+        3. Shards aligned by shard index and node.
+        4. Best performance: keep results distributed if possible.
+        """
+
+        #print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER FLASH ATTENTION")
+        #print(f"{'='*60}")
+        print(f"Matrix Q: {self.matrix_name}")
+        print(f"Matrix K: {cluster_matrixK.matrix_name}")
+        print(f"Matrix V: {cluster_matrixV.matrix_name}")
+        print(f"Operation: {operation}")
+
+        node_count = len(self.node_IP_list)
+        print(f"Number of shards: {node_count}")
+        print(f"Send back combined result: {send_back_result}")
+
+        # GPU tracking per node
+        node_gpu_counters = {}
+
+        #print(f"\n📤 DISTRIBUTING FLASH ATTENTION TO NODES")
+
+        mask_matrix = None
+        if mask is not None:
+            if isinstance(mask, cluster_matrix):
+                mask_matrix = mask
+            else:
+                mask_tensor = torch.as_tensor(mask, dtype=torch.float32)
+                mask_matrix = cluster_matrix(
+                    matrix_file_path=mask_tensor,
+                    cluster_zmq_object=self.cluster_zmq_object,
+                    CPU_GPU_select_list=self.CPU_GPU_select_list,
+                    node_percentages=self.node_percentages,
+                    back_end_select_list=self.back_end_select_list,
+                    split_matrix=False,
+                    dim=self.dim,
+                    auto_set_up=[1, "save"],
+                    matrix_name=f"{self.matrix_name}_causal_mask",
+                )
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select) in enumerate(
+            zip(self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list)
+        ):
+            print(f"\nProcessing shard {shard_index}")
+
+            # ---------- GPU SELECTION ----------
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")
+
+            backend_for_flash = back_end_select if back_end_select in ("llama", "torch") else "llama"
+            if backend_for_flash != back_end_select:
+                print(f"  ⚠️  flash_attn backend '{back_end_select}' unsupported, using '{backend_for_flash}'")
+
+            # ---------- SHARD ALIGNMENT ----------
+            matrix_q = self.matrix_file_paths_list[shard_index]
+            matrix_k = cluster_matrixK.matrix_file_paths_list[shard_index]
+            matrix_v = cluster_matrixV.matrix_file_paths_list[shard_index]
+
+            # ---------- FLASH ATTENTION TRANSPOSE / GPU ----------
+            TransposeQ_str = str(TransposeQ).lower()
+            TransposeK_str = str(TransposeK).lower()
+            TransposeV_str = str(TransposeV).lower()
+            use_gpu_str = str(CPU_GPU_select).lower()
+
+            # ---------- SEND_BACK LOGIC ----------
+            if node_count == 1 and send_back_result:
+                send_back = self.dim * 10 + 1
+            elif send_back_result:
+                send_back = self.dim * 10 + node_count
+            else:
+                send_back = 0
+            print(f"  Send back: {send_back}")
+
+            # ---------- EXTRA PARAM ----------
+            # Must be numeric for C++ stoi parsing; default 0
+            extra_param_numeric = 0
+            if extra_param_value is not None:
+                extra_param_numeric = float(extra_param_value)
+
+            # ---------- MASK ----------
+            mask_arg = ""
+            if mask_matrix is not None:
+                if mask_matrix.matrix_file_paths_list:
+                    if len(mask_matrix.matrix_file_paths_list) > shard_index:
+                        mask_name = mask_matrix.matrix_file_paths_list[shard_index]
+                    else:
+                        mask_name = mask_matrix.matrix_file_paths_list[0]
+                    mask_arg = f" mask={mask_name}"
+
+            backend_arg = f" backend={backend_for_flash}"
+
+            # ---------- BUILD COMMAND ----------
+            command = (
+                f"server_command=flash_attn "
+                f"{matrix_q} {TransposeQ_str} "
+                f"{matrix_k} {TransposeK_str} "
+                f"{matrix_v} {TransposeV_str} "
+                f"{use_gpu_str} {current_gpu_number} {send_back} "
+                f"{operation} {extra_param_numeric}{backend_arg}{mask_arg} {shard_index}"
+            )
+
+            # ---------- SEND COMMAND ----------
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            #print(f"  ✅ Command sent: {command}")
+
+        # ================= ACK HANDLING =================
+        print(f"\n⏳ Waiting for {node_count} ACKs")
+        self.cluster_zmq_object.wait_for_acks(
+            node_count,
+            "ACK_matrixOp_complete"
+        )
+
+        print(f"✅ FLASH ATTENTION COMPLETE")
+
+        # ================= RETURN HANDLING =================
+        # Must match C++ naming: "<Q>x<K>x<V>_shard_<i>.bin"
+        base_result_name = f"{self.matrix_name}x{cluster_matrixK.matrix_name}x{cluster_matrixV.matrix_name}"
+
+        # CASE 1: single node, combined
+        if node_count == 1 and send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        # CASE 2: multi-node combined
+        if send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        # CASE 3: keep distributed (FAST PATH)
+        result = cluster_matrix.__new__(cluster_matrix)
+        result.cluster_zmq_object = self.cluster_zmq_object
+        result.llama_socket_pool = self.llama_socket_pool
+        result.matrix_name = base_result_name
+        result.matrix_labeling = 'attn'
+        result.node_IP_list = list(self.node_IP_list)
+        result.CPU_GPU_select_list = list(self.CPU_GPU_select_list)
+        result.back_end_select_list = list(self.back_end_select_list)
+        result.node_percentages = list(self.node_percentages)
+        result.dim = self.dim
+        result.split_matrix = True
+        result.transpose = False
+        result.matrix_file_paths_list = [
+            f"{base_result_name}_shard_{i}.bin" for i in range(node_count)
+        ]
+
+        return result
+
+    def cluster_rope_operation(
+            self,
+            Transpose=False,
+            send_back_result=False,
+            operation='rope',
+            rope_type=0,              # 0=base, 1=ext, 2=multi
+            exter_parmiters=[]        # list of extra params for C++ RoPE structs
+        ):
+        """
+        Perform a distributed RoPE operation across the cluster.
+        """
+
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER RoPE OPERATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose: {Transpose}")
+        print(f"Send back result: {send_back_result}")
+        print(f"RoPE type: {rope_type}")
+
+        node_count = len(self.node_IP_list)
+        node_gpu_counters = {}
+
+        print(f"\n📤 DISTRIBUTING RoPE TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(
+            zip(
+                self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list,
+                self.matrix_file_paths_list
+            )
+        ):
+            print(f"\nProcessing shard {shard_index}")
+
+            # ---------- GPU SELECTION ----------
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")
+
+            # ---------- FLAGS ----------
+            Transpose_str = str(Transpose).lower()
+            use_gpu_str = str(CPU_GPU_select).lower()
+
+            # ---------- SEND_BACK ----------
+            # RoPE is feature-wise → force dim=1 semantics
+            if node_count == 1 and send_back_result:
+                send_back = 11
+            elif send_back_result:
+                send_back = 10 + node_count
+            else:
+                send_back = 0
+
+            print(f"  Send back: {send_back}")
+
+            # ---------- EXTRA PARAMS ----------
+            if exter_parmiters:
+                extra_param_str = ",".join(str(float(x)) for x in exter_parmiters)
+            else:
+                extra_param_str = "0"
+
+            # ---------- COMMAND ----------
+            command = (
+                f"server_command=rope "
+                f"{node_matrix} "
+                f"{Transpose_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back} "
+                f"{operation} "
+                f"{rope_type} "
+                f"{shard_index} "
+                f"{extra_param_str}"
+            )
+
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent: {command}")
+
+        # ================= ACKS =================
+        print(f"\n⏳ Waiting for {node_count} ACKs")
+        self.cluster_zmq_object.wait_for_acks(node_count, "ACK_matrixOp_complete")
+        print(f"✅ CLUSTER RoPE OPERATION COMPLETE")
+
+        # ================= RESULT IDENTITY =================
+        base_result_name = f"{self.matrix_name}"
+
+        # 🔑 Rebind THIS matrix to the new RoPE output
+        self.matrix_name = base_result_name
+        self.matrix_file_paths_list = [
+            f"{base_result_name}_shard_{i}.bin"
+            for i in range(node_count)
+        ]
+
+        # RoPE creates a new semantic tensor
+        self.matrix_labeling = f"{self.matrix_labeling}"
+
+        # ================= RETURN =================
+        if send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        return self
+
+    def cluster_reshape_operation(
+            self,
+            output_dims,
+            global_input_shape,
+            shard_input_shapes,
+            shard_percentages=None,
+            Transpose=False,
+            num_head=None,
+            send_back_result=False,
+        ):
+
+        if shard_percentages is None:
+            shard_percentages = self.node_percentages
+        if shard_percentages is None:
+            shard_percentages = []
+
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER RESHAPE OPERATION")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Target output shape (torch order): {output_dims}")
+        print(f"Global input shape: {global_input_shape}")
+        print(f"Shard input shapes: {shard_input_shapes}")
+        print(f"Shard percentages: {shard_percentages}")
+        print(f"Number of heads: {num_head}")
+
+        B, H_global, T, head_dim = output_dims
+        total_heads = H_global
+
+        print(f"\nTarget total heads: {total_heads}")
+
+        # --- STEP 1: DERIVE HEADS FROM ACTUAL SHARD COLUMNS ---
+        shard_heads = []
+        for shape in shard_input_shapes:
+            shard_heads.append(shape[1] // head_dim)
+
+        print(f"Derived shard head counts from columns: {shard_heads}")
+        print(f"Sum of shard heads: {sum(shard_heads)} (should equal {total_heads})")
+
+        # --- STEP 2: REPORT IF MISMATCH (NO FIXING, NO MAGIC) ---
+        if sum(shard_heads) != total_heads:
+            print(
+                f"⚠️ WARNING: Physical shard heads ({sum(shard_heads)}) "
+                f"do not match expected ({total_heads})"
+            )
+
+        # --- STEP 3: BUILD OUTPUT SHAPES ---
+        shard_output_shapes = [
+            [B, H, T, head_dim] for H in shard_heads
+        ]
+
+        # --- STEP 4: VALIDATE RESHAPE POSSIBILITY ---
+        for shard_index, (shard_in_shape, out_dims) in enumerate(
+            zip(shard_input_shapes, shard_output_shapes)
+        ):
+            _, H_shard, _, _ = out_dims
+            expected_input_cols = H_shard * head_dim
+
+            print(f"\nShard {shard_index}:")
+            print(f"  Input shape: {shard_in_shape}")
+            print(f"  Target output: {out_dims}")
+            print(f"  Expected input cols for reshape: {expected_input_cols}")
+            print(f"  Actual input cols: {shard_in_shape[1]}")
+            print(f"  Match: {'✓' if shard_in_shape[1] == expected_input_cols else '✗'}")
+
+            if shard_in_shape[1] != expected_input_cols:
+                delta = expected_input_cols - shard_in_shape[1]
+                print(f"  ERROR: Cannot reshape directly!")
+                if delta > 0:
+                    print(f"         -> Requires padding of {delta} columns")
+                else:
+                    print(f"         -> Requires trimming of {-delta} columns")
+
+        print(f"\n⏳ NOT SENDING COMMANDS - SHAPES ONLY")
+        print(f"✅ SHAPE ANALYSIS COMPLETE")
+
+        return self
+
+    def cluster_repeat_operation( 
+            self,  
+            repeat_dims,
+            num_heads=8,  
+            Transpose=False,  
+            send_back_result=False  
+        ):  
+        """  
+        Perform a distributed repeat operation across the cluster.  
+
+        repeat_dims : tuple/list : repeat factors for each dimension (4 elements)  
+        """  
+
+        print(f"\n{'='*60}")  
+        print(f"🚀 STARTING CLUSTER REPEAT OPERATION")  
+        print(f"{'='*60}")  
+        print(f"Matrix: {self.matrix_name}")  
+        print(f"Repeat dims: {repeat_dims}")  
+        print(f"Transpose: {Transpose}")  
+        print(f"Send back result: {send_back_result}")  
+
+        if len(repeat_dims) != 4:  
+            raise ValueError(f"repeat_dims must have 4 elements, got {len(repeat_dims)}")  
+
+        # --------- FIND REPEAT DIM ----------
+        repeat_dim = None
+        for index, num in enumerate(repeat_dims):
+            if num != 1:
+                repeat_dim = index
+                break
+
+        if repeat_dim is None:
+            raise ValueError("No repeat dimension specified (all repeat_dims == 1)")
+
+        node_count = len(self.node_IP_list)  
+        node_gpu_counters = {}  
+
+        print(f"\n📤 DISTRIBUTING REPEAT TO NODES")  
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix, node_percentage) in enumerate(  
+            zip(  
+                self.node_IP_list,  
+                self.CPU_GPU_select_list,  
+                self.back_end_select_list,  
+                self.matrix_file_paths_list,
+                self.node_percentages  
+            )  
+        ):  
+            print(f"\nProcessing shard {shard_index}")  
+
+            # ---------- GPU SELECTION ----------  
+            if node_IP not in node_gpu_counters:  
+                node_gpu_counters[node_IP] = 0  
+            current_gpu_number = node_gpu_counters[node_IP]  
+            if CPU_GPU_select:  
+                node_gpu_counters[node_IP] += 1  
+
+            print(f"  Node: {node_IP}")  
+            print(f"  Backend: {back_end_select}")  
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")  
+
+            # ---------- FLAGS ----------  
+            Transpose_str = str(Transpose).lower()  
+            use_gpu_str = str(CPU_GPU_select).lower()  
+
+            # ---------- SEND_BACK ----------  
+            join_dim = self.dim if self.dim in (0, 1) else 0
+            if node_count == 1 and send_back_result:  
+                send_back = join_dim * 10 + 1  
+            elif send_back_result:  
+                send_back = join_dim * 10 + node_count  
+            else:  
+                send_back = 0  
+
+            if self.matrix_labeling in ('a', 'b') and send_back != 0:
+                send_back = -send_back  
+
+            print(f"  Send back: {send_back}")  
+
+            # ---------- REPEAT DIMS ----------
+            try:
+                shard_repeat_dims = [1, 1, 1, 1]
+
+                node_repeat = num_heads * node_percentage
+                node_repeat_int = int(round(node_repeat))
+
+                if node_repeat_int <= 0:
+                    raise ValueError
+
+                shard_repeat_dims[repeat_dim] = node_repeat_int
+
+                repeat_dims_str = ",".join(str(x) for x in shard_repeat_dims)
+
+            except Exception:
+                raise ValueError(
+                    "Invalid GQA repeat configuration: "
+                    "num_heads * node_percentage must resolve to a positive integer"
+                )
+
+            # ---------- COMMAND ----------  
+            command = (  
+                f"server_command=repeat "  
+                f"{node_matrix} "  
+                f"{Transpose_str} "  
+                f"{use_gpu_str} "  
+                f"{current_gpu_number} "  
+                f"{send_back} "  
+                f"{repeat_dims_str} "  
+                f"{shard_index}"  
+            )  
+
+            socket_eth = self.llama_socket_pool[node_IP]  
+            socket_eth.send_multipart([command.encode()])  
+            print(f"  ✅ Command sent: {command}")  
+
+        # ================= ACKS =================  
+        print(f"\n⏳ Waiting for {node_count} ACKs")  
+        self.cluster_zmq_object.wait_for_acks(node_count, "ACK_matrixOp_complete")  
+        print(f"✅ CLUSTER REPEAT OPERATION COMPLETE")  
+
+        # ================= RESULT HANDLING =================  
+        base_result_name = f"{self.matrix_name}"  
+
+        if node_count == 1 and send_back_result:  
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)  
+
+        if send_back_result:  
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)  
+
+        result = cluster_matrix.__new__(cluster_matrix)  
+        result.cluster_zmq_object = self.cluster_zmq_object  
+        result.llama_socket_pool = self.llama_socket_pool  
+        result.matrix_name = base_result_name  
+        result.matrix_labeling = self.matrix_labeling  
+        result.node_IP_list = list(self.node_IP_list)  
+        result.CPU_GPU_select_list = list(self.CPU_GPU_select_list)  
+        result.back_end_select_list = list(self.back_end_select_list)  
+        result.node_percentages = list(self.node_percentages)  
+        result.dim = self.dim  
+        result.split_matrix = True  
+        result.transpose = False  
+        result.matrix_file_paths_list = [  
+            f"{base_result_name}_shard_{i}.bin" for i in range(node_count)  
+        ]  
+
+        return result
+
+    def send_back(self):
+        """
+        Explicitly trigger shard combination from distributed storage back to head node.
+        Useful when you want to combine distributed results after computation.
+
+        Returns:
+            Combined matrix as torch.Tensor if successful, False otherwise
+        """
+        print(f"\n{'='*60}")
+        print(f"🚀 TRIGGERING SHARD COMBINATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
+
+        node_IP_list_len = len(self.node_IP_list)
+        if node_IP_list_len == 0:
+            print("❌ No nodes available for send_back")
+            return False
+
+        print(f"Number of shards: {node_IP_list_len}")
+
+        # Determine base result name for combined payloads
+        base_result_name = self.matrix_name
+        if self.matrix_file_paths_list:
+            first_name = os.path.basename(self.matrix_file_paths_list[0])
+            if "_shard_" in first_name:
+                base_result_name = first_name.split("_shard_")[0]
+            else:
+                base_result_name = os.path.splitext(first_name)[0]
+
+        # Join dim must be 0 (rows) or 1 (cols)
+        join_dim = self.dim if self.dim in (0, 1) else 0
+
+        # Encode send_back flag: join_dim * 10 + shard_count
+        send_back_flag = join_dim * 10 + node_IP_list_len
+        if self.matrix_labeling in ('a', 'b'):
+            send_back_flag = -send_back_flag
+
+        print(f"Send back flag: {send_back_flag}")
+        print(f"  → system={'2' if send_back_flag < 0 else '1'}, join_dim={join_dim}, shards={node_IP_list_len}")
+
+        print(f"\n📤 SENDING COMBINE COMMANDS TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(
+            zip(self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list,
+                self.matrix_file_paths_list)
+        ):
+            print(f"\nProcessing shard {shard_index}:")
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  Matrix file: {node_matrix}")
+
+            command = (
+                f"server_command=send_back "
+                f"{node_matrix} "
+                f"{shard_index} "
+                f"{send_back_flag}"
+            )
+
+            print(f"  Command: {command}")
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent to node {node_IP} (shard {shard_index})")
+
+        # ===== WAIT FOR ACKS FROM ALL NODES =====
+        expected_acks = node_IP_list_len
+        print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_send_back_complete")
+
+        print(f"✅ ALL SHARDS SENT BACK")
+
+        # ===== WAIT FOR COMBINED RESULT =====
+        print(f"\n🔄 WAITING FOR COMBINED RESULT ({base_result_name})")
+
+        try:
+            combined_matrix = self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+        except Exception as exc:
+            print(f"❌ FAILED TO RECEIVE COMBINED MATRIX: {exc}")
+            return False
+
+        print(f"✅ COMBINED MATRIX RECEIVED")
+        print(f"   Shape: {combined_matrix.shape if hasattr(combined_matrix, 'shape') else 'Unknown'}")
+        return combined_matrix

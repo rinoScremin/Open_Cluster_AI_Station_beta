@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
 set -e
 
-./install_libtorch.sh
+# -------------------------------
+# Paths
+# -------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+GGML_DIR="$PROJECT_ROOT/cluster_matrix/ggml"
 
+cd "$GGML_DIR"
+
+# -------------------------------
+# Download libtorch
+# -------------------------------
+LIBTORCH_VERSION="2.2.2+cpu"
+LIBTORCH_URL="https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.2.2%2Bcpu.zip"
+
+echo "🟢 Downloading libtorch $LIBTORCH_VERSION..."
+curl -L -o libtorch.zip "$LIBTORCH_URL"
+
+echo "📦 Extracting libtorch..."
+unzip -q libtorch.zip -d libtorch
+
+rm libtorch.zip
+echo "✅ libtorch installed to $GGML_DIR/libtorch"
+
+mv libtorch libtorch1
+mv libtorch1/libtorch .
+rm -r libtorch1
+
+# -------------------------------
+# Install system build dependencies
+# -------------------------------
 echo "=== Installing system build dependencies ==="
 sudo apt update
 sudo apt install -y \
@@ -14,12 +43,13 @@ sudo apt install -y \
     libzmq3-dev \
     libpthread-stubs0-dev
 
+# -------------------------------
+# Detect system capabilities
+# -------------------------------
 echo "🔍 Detecting system capabilities..."
 OS="$(uname -s)"
 
-# -------------------------------
-# Detect NVIDIA GPU
-# -------------------------------
+# NVIDIA GPU
 HAS_NVIDIA_GPU=0
 if command -v lspci >/dev/null 2>&1 && lspci | grep -qi nvidia; then
     HAS_NVIDIA_GPU=1
@@ -28,9 +58,7 @@ else
     echo "ℹ️ No NVIDIA GPU detected"
 fi
 
-# -------------------------------
-# Detect CUDA
-# -------------------------------
+# CUDA
 HAS_CUDA=0
 if command -v nvcc >/dev/null 2>&1; then
     HAS_CUDA=1
@@ -39,9 +67,7 @@ else
     echo "ℹ️ CUDA toolkit not found"
 fi
 
-# -------------------------------
-# Detect Vulkan
-# -------------------------------
+# Vulkan
 HAS_VULKAN=0
 if command -v vulkaninfo >/dev/null 2>&1; then
     HAS_VULKAN=1
@@ -50,9 +76,7 @@ else
     echo "ℹ️ Vulkan not available"
 fi
 
-# -------------------------------
-# Detect Metal (macOS only)
-# -------------------------------
+# Metal (macOS only)
 HAS_METAL=0
 if [[ "$OS" == "Darwin" ]]; then
     if system_profiler SPDisplaysDataType 2>/dev/null | grep -qi "metal"; then
@@ -64,21 +88,14 @@ if [[ "$OS" == "Darwin" ]]; then
 fi
 
 # -------------------------------
-# Resolve paths
+# Configure CMake
 # -------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-GGML_DIR="$PROJECT_ROOT/cluster_matrix/ggml"
-
 echo "📂 Project root: $PROJECT_ROOT"
 echo "📂 GGML dir:     $GGML_DIR"
-cd "$GGML_DIR"
 
-# -------------------------------
-# Base flags (CPU ALWAYS ENABLED)
-# -------------------------------
 CMAKE_FLAGS=(
     -DCMAKE_BUILD_TYPE=Release
+    -DGGML_CPU=ON
     -DGGML_BLAS=ON
     -DGGML_BLAS_VENDOR=OpenBLAS
     -DGGML_OPENCL=OFF
@@ -87,9 +104,7 @@ CMAKE_FLAGS=(
     -DGGML_METAL=OFF
 )
 
-# -------------------------------
-# Backend selection (CPU + accel)
-# -------------------------------
+# Backend selection
 if [[ $HAS_NVIDIA_GPU -eq 1 && $HAS_CUDA -eq 1 ]]; then
     echo "🚀 Enabling CUDA backend (CPU + OpenBLAS + CUDA)"
     CMAKE_FLAGS+=(-DGGML_CUDA=ON)
