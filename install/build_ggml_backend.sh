@@ -3,6 +3,18 @@ set -euo pipefail
 IFS=$'\n\t'
 trap 'echo "❌ ggml backend build failed at line $LINENO. See logs above." >&2' ERR
 
+sudo apt install libopenblas-dev
+sudo apt install pkg-config
+sudo apt install \
+  libvulkan-dev \
+  vulkan-tools \
+  glslc \
+  glslang-tools
+
+sudo apt install ocl-icd-opencl-dev
+sudo apt install libzmq3-dev
+pkg-config --modversion libzmq
+
 # -------------------------------
 # Paths
 # -------------------------------
