@@ -86,6 +86,7 @@ pip_install \
   tqdm
 
 pip_install nicegui
+pip install sentencepiece
 echo "🔥 Installing PyTorch"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
