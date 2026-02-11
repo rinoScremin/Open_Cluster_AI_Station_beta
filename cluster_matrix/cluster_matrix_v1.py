@@ -80,7 +80,6 @@ def check_combined_result_values(c_ref_path, combined):
         print("⚠️  Results differ beyond allclose thresholds")
     print(f"Elements outside threshold: {bad_count}/{total} ({bad_pct:.2f}%)")
 
-
 class cluster_zmq:
     def __init__(self, node_IP_list):
         # Keep the caller-provided slot list (may include duplicates).
@@ -611,7 +610,6 @@ class cluster_zmq:
         except Exception:
             pass  # Avoid exceptions in destructor
    
-
 class cluster_matrix:
     def __init__(
         self,
@@ -1133,20 +1131,21 @@ class cluster_matrix:
             # ---------------------------
             self.matrix_file_paths_list = []
 
-            # Create disk folder path
-            disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
-            os.makedirs(disk_folder_path, exist_ok=True)
-
             shard0_filename = f"{self.matrix_name}_shard_0.bin"
             shard1_filename = f"{self.matrix_name}_shard_1.bin"
-            shard0_disk_path = os.path.join(disk_folder_path, shard0_filename)
-            shard1_disk_path = os.path.join(disk_folder_path, shard1_filename)
+            if self.save_bin_matrix:
+                # Create disk folder path
+                disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
+                os.makedirs(disk_folder_path, exist_ok=True)
 
-            # Save matrices locally to DISK (no /dev/shm)
-            self.save_matrix_binary(self.node_matrices[0], shard0_disk_path)
-            self.save_matrix_binary(self.node_matrices[1], shard1_disk_path)
-            print(f"  Saved shard 0 to: {shard0_disk_path}")
-            print(f"  Saved shard 1 to: {shard1_disk_path}")
+                shard0_disk_path = os.path.join(disk_folder_path, shard0_filename)
+                shard1_disk_path = os.path.join(disk_folder_path, shard1_filename)
+
+                # Save matrices locally to DISK (no /dev/shm)
+                self.save_matrix_binary(self.node_matrices[0], shard0_disk_path)
+                self.save_matrix_binary(self.node_matrices[1], shard1_disk_path)
+                print(f"  Saved shard 0 to: {shard0_disk_path}")
+                print(f"  Saved shard 1 to: {shard1_disk_path}")
 
             # Determine how many nodes get each shard
             total_nodes = len(self.node_IP_list)
