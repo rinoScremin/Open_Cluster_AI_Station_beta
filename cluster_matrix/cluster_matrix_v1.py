@@ -1053,6 +1053,8 @@ class cluster_matrix:
                 # Store the matrix name (used as key on each node's C++ server).
                 self.matrix_file_paths_list.append(save_name)
                 #print(f"  Added matrix name to list: {save_name}")
+                # Drop the shard reference to free RAM as soon as it has been streamed.
+                self.node_matrices[shard_index] = None
                     
             # Handle shard for REMOTE NODE
             elif node_IP != self.IP:
@@ -1065,6 +1067,10 @@ class cluster_matrix:
                 # Store the matrix name (used as key on each node's C++ server).
                 self.matrix_file_paths_list.append(save_name)
                 #print(f"  Added matrix name to list: {save_name}")
+                # Drop the shard reference to free RAM as soon as it has been streamed.
+                self.node_matrices[shard_index] = None
+        # Clear the shard list after all streaming is done.
+        self.node_matrices = []
         return self.matrix_file_paths_list
 
     def save_distribute_full_matrix_bin(self):
@@ -1111,6 +1117,8 @@ class cluster_matrix:
             self.cluster_zmq_object.stream_matrix_binary(node_ip, full_matrix, stream_name)
             self.cluster_zmq_object.wait_for_acks(1, save_name)
         print(f"Full matrix distribution completed")
+        # Ensure any prior shard buffers are released.
+        self.node_matrices = []
         return 0
 
     def save_distribute_matrixA_grid_bin(self):
