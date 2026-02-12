@@ -351,7 +351,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'q_proj_list'):
                 self.q_proj_list = []
-            self.q_proj_list.append((key, cm, tensor.shape, shard_shapes))
+            self.q_proj_list.append((key, cm))
             return 'q'
 
         elif 'k_proj' in key_lower and 'bias' not in key_lower:
@@ -367,7 +367,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'k_proj_list'):
                 self.k_proj_list = []
-            self.k_proj_list.append((key, cm, tensor.shape, shard_shapes))
+            self.k_proj_list.append((key, cm))
             return 'k'
 
         elif 'v_proj' in key_lower and 'bias' not in key_lower:
@@ -383,7 +383,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'v_proj_list'):
                 self.v_proj_list = []
-            self.v_proj_list.append((key, cm, tensor.shape, shard_shapes))
+            self.v_proj_list.append((key, cm))
             return 'v'
 
         elif 'o_proj' in key_lower and 'bias' not in key_lower:
@@ -402,7 +402,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'o_proj_list'):
                 self.o_proj_list = []
-            self.o_proj_list.append((key, cm, tensor.shape, shard_shapes))
+            self.o_proj_list.append((key, cm))
             return 'o'
 
 
@@ -418,7 +418,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_up_list'):
                 self.mlp_up_list = []
-            self.mlp_up_list.append((key, cm, tensor.shape, shard_shapes))
+            self.mlp_up_list.append((key, cm))
             return 'up'
 
         elif 'down_proj' in key_lower or 'w2' in key_lower or 'fc2' in key_lower:
@@ -432,7 +432,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_down_list'):
                 self.mlp_down_list = []
-            self.mlp_down_list.append((key, cm, tensor.shape, shard_shapes))
+            self.mlp_down_list.append((key, cm))
             return 'down'
 
         elif 'gate_proj' in key_lower or 'w1' in key_lower or 'fc1' in key_lower:
@@ -446,7 +446,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_gate_list'):
                 self.mlp_gate_list = []
-            self.mlp_gate_list.append((key, cm, tensor.shape, shard_shapes))
+            self.mlp_gate_list.append((key, cm))
             return 'gate'
 
 
