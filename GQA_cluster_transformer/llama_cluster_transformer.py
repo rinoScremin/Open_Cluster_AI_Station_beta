@@ -6,6 +6,7 @@ import numpy as np
 from typing import Optional, List, Union, Callable
 import sys
 from gguf_parser import GGUFParser
+from transformers import AutoTokenizer  # make sure this import exists
 
 # Ensure local package imports work when running as a script
 THIS_DIR = os.path.dirname(__file__)
@@ -93,6 +94,7 @@ def _build_causal_mask(
     q_len: int,
     kv_len: int,
     offset: int = 0,
+    kv_start: int = 0,
     device=None,
     dtype: torch.dtype = torch.float32,
     additive: bool = True,
@@ -100,12 +102,13 @@ def _build_causal_mask(
     """
     Build a causal mask in [q_len, kv_len] layout.
     offset shifts the query positions for decode (past_len).
+    kv_start is the absolute start position of the KV window.
     If additive=True, returns large-negative bias in the given dtype.
     """
     if device is None:
         device = "cpu"
     row_idx = torch.arange(q_len, device=device).unsqueeze(1) + int(offset)
-    col_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    col_idx = torch.arange(kv_len, device=device).unsqueeze(0) + int(kv_start)
     mask = col_idx > row_idx
     if not additive:
         return mask
@@ -130,24 +133,103 @@ class RMSNorm(torch.nn.Module):
 
 class Tokenizer:
     def __init__(self, model_path: str):
-        # reload tokenizer
-        assert os.path.isfile(model_path), model_path
-        self.sp_model = SentencePieceProcessor(model_file=model_path)
-        logger.info(f"Reloaded SentencePiece model from {model_path}")
+        self.model_path = self._resolve_model_path(model_path)
+        self.sp_model = None
+        self.hf_tokenizer = None
+        self._backend = None
 
-        # BOS / EOS token IDs
-        self.n_words: int = self.sp_model.vocab_size()
-        self.bos_id: int = self.sp_model.bos_id()
-        self.eos_id: int = self.sp_model.eos_id()
-        self.pad_id: int = self.sp_model.pad_id()
+        if os.path.isfile(self.model_path):
+            lower_name = os.path.basename(self.model_path).lower()
+            if lower_name.endswith(".model"):
+                self._init_sentencepiece(self.model_path)
+            elif lower_name == "tokenizer.json":
+                self._init_hf(os.path.dirname(self.model_path), tokenizer_file=self.model_path)
+            else:
+                self._init_hf(os.path.dirname(self.model_path))
+        else:
+            self._init_hf(self.model_path)
+
+        self._normalize_special_ids()
         logger.info(
             f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id}"
         )
-        assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
+
+    def _resolve_model_path(self, model_path: str) -> str:
+        raw_path = os.path.expanduser(model_path)
+        if os.path.exists(raw_path):
+            return os.path.abspath(raw_path)
+
+        if not os.path.isabs(raw_path):
+            candidate = os.path.abspath(os.path.join(PROJECT_ROOT, raw_path))
+            if os.path.exists(candidate):
+                return candidate
+
+        # If the path points to llm_models but the project root moved, try local project path.
+        marker = os.sep + "llm_models" + os.sep
+        if marker in raw_path:
+            suffix = raw_path.split(marker, 1)[1]
+            candidate = os.path.join(PROJECT_ROOT, "llm_models", suffix)
+            if os.path.exists(candidate):
+                logger.warning(
+                    "Tokenizer path not found: %s. Using local project path: %s",
+                    raw_path,
+                    candidate,
+                )
+                return os.path.abspath(candidate)
+
+        return raw_path
+
+    def _init_sentencepiece(self, sp_path: str) -> None:
+        self._backend = "sp"
+        self.sp_model = SentencePieceProcessor()
+        self.sp_model.load(sp_path)
+        self.n_words = int(self.sp_model.vocab_size())
+        self.bos_id = self.sp_model.bos_id()
+        self.eos_id = self.sp_model.eos_id()
+        self.pad_id = self.sp_model.pad_id()
+
+    def _init_hf(self, hf_path: str, tokenizer_file: Optional[str] = None) -> None:
+        self._backend = "hf"
+        kwargs = {}
+        if tokenizer_file is not None:
+            kwargs["tokenizer_file"] = tokenizer_file
+        if os.path.exists(hf_path):
+            kwargs["local_files_only"] = True
+
+        self.hf_tokenizer = AutoTokenizer.from_pretrained(hf_path, **kwargs)
+        vocab_size = getattr(self.hf_tokenizer, "vocab_size", None)
+        self.n_words = int(vocab_size if vocab_size is not None else len(self.hf_tokenizer))
+
+        self.bos_id = getattr(self.hf_tokenizer, "bos_token_id", None)
+        if self.bos_id is None:
+            self.bos_id = getattr(self.hf_tokenizer, "cls_token_id", None)
+
+        self.eos_id = getattr(self.hf_tokenizer, "eos_token_id", None)
+        if self.eos_id is None:
+            self.eos_id = getattr(self.hf_tokenizer, "sep_token_id", None)
+
+        self.pad_id = getattr(self.hf_tokenizer, "pad_token_id", None)
+
+    def _normalize_special_ids(self) -> None:
+        if self.pad_id is None or int(self.pad_id) < 0:
+            self.pad_id = self.eos_id
+        if self.pad_id is None or int(self.pad_id) < 0:
+            self.pad_id = 0
+        if self.bos_id is None or int(self.bos_id) < 0:
+            self.bos_id = self.eos_id if self.eos_id is not None and int(self.eos_id) >= 0 else self.pad_id
+        if self.eos_id is None or int(self.eos_id) < 0:
+            self.eos_id = self.pad_id
+
+        self.bos_id = int(self.bos_id)
+        self.eos_id = int(self.eos_id)
+        self.pad_id = int(self.pad_id)
 
     def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
         assert type(s) is str
-        t = self.sp_model.encode(s)
+        if self._backend == "sp":
+            t = self.sp_model.encode_as_ids(s)
+        else:
+            t = self.hf_tokenizer.encode(s, add_special_tokens=False)
         if bos:
             t = [self.bos_id] + t
         if eos:
@@ -155,7 +237,10 @@ class Tokenizer:
         return t
 
     def decode(self, t: List[int]) -> str:
-        return self.sp_model.decode(t)
+        if self._backend == "sp":
+            return self.sp_model.decode_ids(t)
+        return self.hf_tokenizer.decode(t, skip_special_tokens=False)
+
 
 class llama_cluster_transformer:
 
@@ -206,6 +291,18 @@ class llama_cluster_transformer:
 
         self.max_batch_size = 32
         self.max_seq_len = int(getattr(self.model, "max_position_embeddings", 1024) or 1024)
+        self.kv_window = int(os.environ.get("OPEN_CLUSTER_KV_WINDOW", "2048"))
+        if self.kv_window <= 0:
+            self.kv_window = self.max_seq_len
+        if self.kv_window > self.max_seq_len:
+            self.kv_window = self.max_seq_len
+        kv_dtype_name = os.environ.get("OPEN_CLUSTER_KV_CACHE_DTYPE", "fp16").strip().lower()
+        if kv_dtype_name in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
+        elif kv_dtype_name in ("fp32", "float32"):
+            self.kv_cache_dtype = torch.float32
+        else:
+            self.kv_cache_dtype = torch.float16
 
         # RoPE cache
         self._rope_theta = getattr(self.model, "rope_theta", 10000.0) or 10000.0
@@ -226,15 +323,18 @@ class llama_cluster_transformer:
 
     def _init_kv_cache(self):
         """Initialize key-value cache for attention."""
+        window = int(self.kv_window) if self.kv_window else self.max_seq_len
         self.cache_k = [
             torch.zeros(
-                (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim)
+                (self.max_batch_size, window, self.n_kv_heads, self.head_dim),
+                dtype=self.kv_cache_dtype,
             )
             for _ in range(self.n_layers)
         ]
         self.cache_v = [
             torch.zeros(
-                (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim)
+                (self.max_batch_size, window, self.n_kv_heads, self.head_dim),
+                dtype=self.kv_cache_dtype,
             )
             for _ in range(self.n_layers)
         ]
@@ -243,25 +343,74 @@ class llama_cluster_transformer:
         if layer_id < 0 or layer_id >= len(self.cache_k):
             raise ValueError(f"Invalid layer_id for KV cache: {layer_id}")
 
-        self.cache_k[layer_id] = self.cache_k[layer_id].to(k)
-        self.cache_v[layer_id] = self.cache_v[layer_id].to(v)
+        cache_k = self.cache_k[layer_id]
+        cache_v = self.cache_v[layer_id]
+        if cache_k.device != k.device or cache_k.dtype != self.kv_cache_dtype:
+            cache_k = cache_k.to(device=k.device, dtype=self.kv_cache_dtype)
+            cache_v = cache_v.to(device=v.device, dtype=self.kv_cache_dtype)
+            self.cache_k[layer_id] = cache_k
+            self.cache_v[layer_id] = cache_v
 
-        # k, v are [B, T, n_kv, hd]
-        self.cache_k[layer_id][:bsz, start_pos:start_pos + seqlen, :, :] = k
-        self.cache_v[layer_id][:bsz, start_pos:start_pos + seqlen, :, :] = v
+        window = cache_k.size(1)
+        abs_end = int(start_pos) + int(seqlen)
+        kv_start = max(0, abs_end - window)
+        kv_len = abs_end - kv_start
 
-        keys = self.cache_k[layer_id][:bsz, :start_pos + seqlen, :, :]
-        values = self.cache_v[layer_id][:bsz, :start_pos + seqlen, :, :]
+        if seqlen > 0:
+            write_abs_start = max(int(start_pos), kv_start)
+            write_len = abs_end - write_abs_start
+            if write_len > 0:
+                write_offset = write_abs_start - int(start_pos)
+                src_k = k[:, write_offset:write_offset + write_len, :, :].to(dtype=self.kv_cache_dtype)
+                src_v = v[:, write_offset:write_offset + write_len, :, :].to(dtype=self.kv_cache_dtype)
+                write_pos = write_abs_start % window
+                first = min(write_len, window - write_pos)
+                cache_k[:bsz, write_pos:write_pos + first, :, :] = src_k[:, :first, :, :]
+                cache_v[:bsz, write_pos:write_pos + first, :, :] = src_v[:, :first, :, :]
+                if write_len > first:
+                    tail = write_len - first
+                    cache_k[:bsz, 0:tail, :, :] = src_k[:, first:first + tail, :, :]
+                    cache_v[:bsz, 0:tail, :, :] = src_v[:, first:first + tail, :, :]
 
-        return keys, values
+        start_idx = kv_start % window if kv_len > 0 else 0
+        if kv_len <= window - start_idx:
+            keys = cache_k[:bsz, start_idx:start_idx + kv_len, :, :]
+            values = cache_v[:bsz, start_idx:start_idx + kv_len, :, :]
+        else:
+            first = cache_k[:bsz, start_idx:, :, :]
+            second = cache_k[:bsz, : kv_len - (window - start_idx), :, :]
+            keys = torch.cat([first, second], dim=1)
+
+            first_v = cache_v[:bsz, start_idx:, :, :]
+            second_v = cache_v[:bsz, : kv_len - (window - start_idx), :, :]
+            values = torch.cat([first_v, second_v], dim=1)
+
+        return keys, values, kv_start
 
     def get_kv_cache(self, layer_id, seq_len, start_pos):
         """Retrieve KV cache for a specific layer."""
         if layer_id < 0 or layer_id >= len(self.cache_k):
             return None, None
-        keys = self.cache_k[layer_id][:, :start_pos + seq_len, :, :]
-        values = self.cache_v[layer_id][:, :start_pos + seq_len, :, :]
-        return keys, values
+        cache_k = self.cache_k[layer_id]
+        cache_v = self.cache_v[layer_id]
+        window = cache_k.size(1)
+        abs_end = int(start_pos) + int(seq_len)
+        kv_start = max(0, abs_end - window)
+        kv_len = abs_end - kv_start
+        start_idx = kv_start % window if kv_len > 0 else 0
+        if kv_len <= window - start_idx:
+            keys = cache_k[:, start_idx:start_idx + kv_len, :, :]
+            values = cache_v[:, start_idx:start_idx + kv_len, :, :]
+        else:
+            keys = torch.cat(
+                [cache_k[:, start_idx:, :, :], cache_k[:, : kv_len - (window - start_idx), :, :]],
+                dim=1,
+            )
+            values = torch.cat(
+                [cache_v[:, start_idx:, :, :], cache_v[:, : kv_len - (window - start_idx), :, :]],
+                dim=1,
+            )
+        return keys, values, kv_start
     
     def clear_kv_cache(self):
         """Clear the KV cache."""
@@ -380,6 +529,7 @@ class llama_cluster_transformer:
         q_len: int,
         kv_len: int,
         offset: int = 0,
+        kv_start: int = 0,
         device=None,
         dtype: torch.dtype = torch.float32,
         additive: bool = True,
@@ -388,6 +538,7 @@ class llama_cluster_transformer:
             q_len=q_len,
             kv_len=kv_len,
             offset=offset,
+            kv_start=kv_start,
             device=device,
             dtype=dtype,
             additive=additive,
@@ -685,10 +836,13 @@ class llama_cluster_transformer:
 
         # ---- KV cache ----
         layer_id = 0
-        k_cache, v_cache = self.update_kv_cache(layer_id, k, v, bsz, T, start_pos)
+        k_cache, v_cache, kv_start = self.update_kv_cache(layer_id, k, v, bsz, T, start_pos)
 
         # ---- Attention ----
         q = q.transpose(1, 2)  # [B, n_heads, T, hd]
+        if k_cache.dtype != q.dtype:
+            k_cache = k_cache.to(dtype=q.dtype)
+            v_cache = v_cache.to(dtype=q.dtype)
         k_cache = k_cache.transpose(1, 2)  # [B, n_kv, T, hd]
         v_cache = v_cache.transpose(1, 2)  # [B, n_kv, T, hd]
 
@@ -719,6 +873,7 @@ class llama_cluster_transformer:
                 q_len=q_len,
                 kv_len=kv_len,
                 offset=start_pos,
+                kv_start=kv_start,
                 device=attn_scores.device,
                 dtype=attn_scores.dtype,
                 additive=True,
@@ -802,13 +957,13 @@ class llama_cluster_transformer:
                 save_bin_matrix=False
             )
 
-            _, Q_weight, _, _ = self.model.q_proj_list[layer_index]
-            _, K_weight, _, _ = self.model.k_proj_list[layer_index]
-            _, V_weight, _, _ = self.model.v_proj_list[layer_index]
-            _, O_weight, _, _ = self.model.o_proj_list[layer_index]
-            _, hidden_up_weight, _, _ = self.model.mlp_up_list[layer_index]
-            _, hidden_down_weight, _, _ = self.model.mlp_down_list[layer_index]
-            _, hidden_gate_weight, _, _ = self.model.mlp_gate_list[layer_index]
+            _, Q_weight = self.model.q_proj_list[layer_index]
+            _, K_weight = self.model.k_proj_list[layer_index]
+            _, V_weight = self.model.v_proj_list[layer_index]
+            _, O_weight = self.model.o_proj_list[layer_index]
+            _, hidden_up_weight = self.model.mlp_up_list[layer_index]
+            _, hidden_down_weight = self.model.mlp_down_list[layer_index]
+            _, hidden_gate_weight = self.model.mlp_gate_list[layer_index]
 
             q_cluster = x_norm_cluster.cluster_shard_operation(Q_weight, False, False, True)
             k_cluster = x_norm_cluster.cluster_shard_operation(K_weight, False, False, True)
@@ -834,9 +989,12 @@ class llama_cluster_transformer:
 
             q, k = self._apply_rotary(q, k, seq_len=T, offset=start_pos)
 
-            k_cache, v_cache = self.update_kv_cache(layer_index, k, v, bsz, T, start_pos)
+            k_cache, v_cache, kv_start = self.update_kv_cache(layer_index, k, v, bsz, T, start_pos)
             # ---- Attention ----
             q = q.transpose(1, 2)  # [B, n_heads, T, hd]
+            if k_cache.dtype != q.dtype:
+                k_cache = k_cache.to(dtype=q.dtype)
+                v_cache = v_cache.to(dtype=q.dtype)
             k_cache = k_cache.transpose(1, 2)  # [B, n_kv, T, hd]
             v_cache = v_cache.transpose(1, 2)  # [B, n_kv, T, hd]
 
@@ -892,6 +1050,7 @@ class llama_cluster_transformer:
                 q_len=q_len,
                 kv_len=kv_len,
                 offset=start_pos,
+                kv_start=kv_start,
                 device=q.device,
                 dtype=q.dtype,
                 additive=True,
@@ -1005,8 +1164,9 @@ def main_test():
     # Force FP32 weights for closer numerical parity with vanilla LLaMA test.
     os.environ["CLUSTER_FORCE_FP32"] = "1"
 
+    model_dir = os.path.join(PROJECT_ROOT, "llm_models", "TinyLlama-1.1B-Chat-v1.0")
     model = hugging_face_model_handler(
-        model_path="/home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0",
+        model_path=model_dir,
         cluster_zmq_object=cluster_zmq_obj,
         percentages=percentages,
         CPU_GPU_select_list=CPU_GPU_select_list,
@@ -1014,12 +1174,12 @@ def main_test():
     ) 
     
     print('\n')
-    print('test4: /home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0')
+    print(f'test4: {model_dir}')
     print('\n')
     #cache_mode = "save" if os.environ.get("CLUSTER_FORCE_FP32") in ("1", "true", "True") else "load"
     model.cache_model_tensors(saveOrload='load')
 
-    Tokenizer_test = Tokenizer('/home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model')
+    Tokenizer_test = Tokenizer(os.path.join(model_dir, "tokenizer.model"))
 
     llama_test = llama_cluster_transformer(Tokenizer_test, model)
     
@@ -1058,8 +1218,9 @@ def main():
     # Force FP32 weights for closer numerical parity with vanilla LLaMA test.
     os.environ["CLUSTER_FORCE_FP32"] = "1"
 
+    model_dir = os.path.join(PROJECT_ROOT, "llm_models", "Llama-3.2-3B-Instruct")
     model = hugging_face_model_handler(
-        model_path="/home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0",
+        model_path=model_dir,
         cluster_zmq_object=cluster_zmq_obj,
         percentages=percentages,
         CPU_GPU_select_list=CPU_GPU_select_list,
@@ -1067,15 +1228,16 @@ def main():
     ) 
     
     print('\n')
-    print('test4: /home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0')
+    print(f'test4: {model_dir}')
     print('\n')
     #cache_mode = "save" if os.environ.get("CLUSTER_FORCE_FP32") in ("1", "true", "True") else "load"
     model.cache_model_tensors(saveOrload='load')
 
-    Tokenizer_test = Tokenizer('/home/rino/Desktop/Open_Cluster_AI_Station_beta/llm_models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model')
+    Tokenizer_test = Tokenizer(model_dir)
 
-    llama_test = llama_cluster_transformer(Tokenizer_test, model)
     
+    llama_test = llama_cluster_transformer(Tokenizer_test, model)
+
     def _clean_reply(text: str) -> str:
         for tok in ("<|assistant|>", "<|user|>", "<|system|>", "</s>"):
             text = text.replace(tok, "")
