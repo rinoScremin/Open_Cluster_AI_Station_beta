@@ -101,7 +101,8 @@ class ClusterTransformerUI:
                 self.ui_model.cache_model_tensors(saveOrload=saveOrLoad)
                 tokenizer_path = os.path.join(self.selected_model_path, 'tokenizer.model')
                 if not os.path.isfile(tokenizer_path):
-                    raise FileNotFoundError(f"tokenizer.model not found in {self.selected_model_path}")
+                    print(f"tokenizer.model not found in {self.selected_model_path}")
+                    tokenizer_path = self.selected_model_path
                 self.Tokenizer = Tokenizer(tokenizer_path)
                 self.cluster_transformer = llama_cluster_transformer(self.Tokenizer, self.ui_model)
                 self.model_error = None
