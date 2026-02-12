@@ -146,6 +146,14 @@ std::string get_env(const char* env_var, const char* default_val)
     return env_value ? std::string(env_value) : std::string(default_val);
 }
 
+static inline bool get_env_flag(const char* env_var, bool default_val = false) {
+    const char* v = std::getenv(env_var);
+    if (!v) return default_val;
+    std::string s(v);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    return (s == "1" || s == "true" || s == "yes" || s == "on");
+}
+
 static inline int normalize_dtype_tag_from_bin_header_int(int tag_or_ndim) {
     // v2: dtype_tag (negative). v1: ndim (positive) => legacy float32.
     return (tag_or_ndim < 0) ? tag_or_ndim : -1;
@@ -638,6 +646,7 @@ class llama_zmq_server
 	            if (!vram.enabled(backend_index)) {
 	                return ok;
 	            }
+	            const bool vram_only_mode = get_env_flag("OPEN_CLUSTER_VRAM_ONLY", false);
 
 	            for (const auto& f : files_or_names) {
 	                const std::string key = normalize_matrix_key(f);
@@ -646,15 +655,26 @@ class llama_zmq_server
 	                    continue;
 	                }
 	                // GGML tensor dims are {cols, rows, depth, batch}
-	                vram.cache_tensor_f32_4d(
-	                    backend_index,
-	                    key,
-	                    obj.data->data(),
-	                    obj.cols_A,
-	                    obj.rows_A,
-	                    obj.depthA,
-	                    obj.batchA
-	                );
+	                bool cached_to_vram = false;
+	                if (vram.get_tensor(backend_index, key)) {
+	                    cached_to_vram = true;
+	                } else {
+	                    cached_to_vram = vram.cache_tensor_f32_4d(
+	                        backend_index,
+	                        key,
+	                        obj.data->data(),
+	                        obj.cols_A,
+	                        obj.rows_A,
+	                        obj.depthA,
+	                        obj.batchA
+	                    );
+	                }
+
+	                if (vram_only_mode && cached_to_vram) {
+	                    obj.vram_only = true;
+	                    obj.data.reset();
+	                    upsert_matrix_shard_object(std::move(obj));
+	                }
 	            }
 
 	            return ok;
@@ -2192,8 +2212,9 @@ class llama_zmq_server
             }
 
 			            auto process_payload = [&](const std::string& filename_in, const std::vector<uint8_t>& bytes) {
-			                std::string filename = normalize_matrix_key(filename_in);
-			                bool prefer_vram = false;
+	                std::string filename = normalize_matrix_key(filename_in);
+	                bool prefer_vram = false;
+	                const bool vram_only_mode = get_env_flag("OPEN_CLUSTER_VRAM_ONLY", false);
 	                const std::string vram_prefix = "VRAM|";
 	                if (filename.rfind(vram_prefix, 0) == 0) {
 	                    prefer_vram = true;
@@ -2267,44 +2288,56 @@ class llama_zmq_server
 	                }
 
 	                // If requested, try to cache this matrix into VRAM (best-effort).
+	                bool cached_to_vram = false;
 	                if (prefer_vram) {
 	                    const int backend_index = default_vram_backend_index();
 	                    auto& vram = get_vram_cache_manager();
 	                    if (backend_index >= 0 && vram.enabled(backend_index) && obj.data) {
-	                        vram.cache_tensor_f32_4d(
-	                            backend_index,
-	                            obj.base_file_name,
-	                            obj.data->data(),
-	                            obj.cols_A,
-	                            obj.rows_A,
-	                            obj.depthA,
-	                            obj.batchA
-	                        );
+	                        if (vram.get_tensor(backend_index, obj.base_file_name)) {
+	                            cached_to_vram = true;
+	                        } else {
+	                            cached_to_vram = vram.cache_tensor_f32_4d(
+	                                backend_index,
+	                                obj.base_file_name,
+	                                obj.data->data(),
+	                                obj.cols_A,
+	                                obj.rows_A,
+	                                obj.depthA,
+	                                obj.batchA
+	                            );
+	                        }
 	                    }
+	                }
+
+	                if (prefer_vram && cached_to_vram && vram_only_mode) {
+	                    obj.vram_only = true;
+	                    obj.data.reset();
 	                }
 
 	                upsert_matrix_shard_object(std::move(obj));
 
                 // Persist the exact bytes to disk for later reload via `load_matrix_shard_object_list`.
                 // (No /dev/shm usage; matrix_shard_folder defaults to `matrix_shards/`.)
-                try {
-                    std::filesystem::path shard_dir(matrix_shard_folder);
-                    if (!shard_dir.is_absolute()) {
-                        shard_dir = std::filesystem::path(project_folder) / shard_dir;
-                    }
-                    std::filesystem::create_directories(shard_dir);
-                    std::filesystem::path out_path = shard_dir / filename;
+                if (!(prefer_vram && cached_to_vram && vram_only_mode)) {
+                    try {
+                        std::filesystem::path shard_dir(matrix_shard_folder);
+                        if (!shard_dir.is_absolute()) {
+                            shard_dir = std::filesystem::path(project_folder) / shard_dir;
+                        }
+                        std::filesystem::create_directories(shard_dir);
+                        std::filesystem::path out_path = shard_dir / filename;
 
-                    std::ofstream file(out_path, std::ios::binary);
-                    if (!file.is_open()) {
-                        std::cerr << "ERROR: Failed to open for write: " << out_path << std::endl;
-                    } else {
-                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                        file.close();
+                        std::ofstream file(out_path, std::ios::binary);
+                        if (!file.is_open()) {
+                            std::cerr << "ERROR: Failed to open for write: " << out_path << std::endl;
+                        } else {
+                            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                            file.close();
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "ERROR: Failed to persist matrix bytes for " << filename
+                                  << ": " << e.what() << std::endl;
                     }
-                } catch (const std::exception& e) {
-                    std::cerr << "ERROR: Failed to persist matrix bytes for " << filename
-                              << ": " << e.what() << std::endl;
                 }
 
                 send_ack(filename);
@@ -3981,9 +4014,8 @@ class llama_zmq_server
                     std::cout << "  depthB: " << depthB << std::endl;
 
 
-	                if (!matrixA.data || !matrixB.data) {
-	                    throw std::runtime_error("Missing matrix data for llama backend inputs");
-	                }
+	                const bool has_a_data = (matrixA.data && !matrixA.data->empty());
+	                const bool has_b_data = (matrixB.data && !matrixB.data->empty());
 
                     // Pre-check shapes to avoid ggml assertion failures for invalid ops.
                     {
@@ -4078,7 +4110,8 @@ class llama_zmq_server
 	                if (can_use_vram) {
 	                    auto& vram = get_vram_cache_manager();
 	                    if (vram.enabled(gpu_id)) {
-	                        if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
+	                        ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
+	                        if (!a_t && has_a_data) {
 	                            vram.cache_tensor_f32_4d(
 	                                gpu_id,
 	                                matrixA.base_file_name,
@@ -4088,8 +4121,11 @@ class llama_zmq_server
 	                                depthA,
 	                                batchA
 	                            );
+	                            a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
 	                        }
-	                        if (!vram.get_tensor(gpu_id, matrixB.base_file_name)) {
+
+	                        ggml_tensor* b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
+	                        if (!b_t && has_b_data) {
 	                            vram.cache_tensor_f32_4d(
 	                                gpu_id,
 	                                matrixB.base_file_name,
@@ -4099,10 +4135,9 @@ class llama_zmq_server
 	                                depthB,
 	                                batchB
 	                            );
+	                            b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
 	                        }
 
-	                        ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
-	                        ggml_tensor* b_t = vram.get_tensor(gpu_id, matrixB.base_file_name);
 	                        if (a_t && b_t) {
 	                            result = matrix_backend_llama.matrix_op_nd_tensors(a_t, b_t, backend, operation_type);
 	                        }
@@ -4111,6 +4146,11 @@ class llama_zmq_server
 
 	                    // Fallback: host path (still runs on GPU if requested)
 	                if (!result.data) {
+	                    if (!has_a_data || !has_b_data) {
+	                        throw std::runtime_error(
+	                            "Missing matrix data for llama backend inputs (VRAM cache miss)"
+	                        );
+	                    }
 	                    const float* a_ptr = matrixA.data->data();
 	                    const float* b_ptr = matrixB.data->data();
 	                    std::unique_ptr<float[]> a_tmp;
@@ -4437,9 +4477,7 @@ class llama_zmq_server
                     int batch = matrixA.batchA;
                     int depth = matrixA.depthA;
 
-                    if (!matrixA.data) {
-                        throw std::runtime_error("Missing matrix data for transformer operation");
-                    }
+                    const bool has_a_data = (matrixA.data && !matrixA.data->empty());
 
                     ggml_backend_t backend;
                     {
@@ -4461,21 +4499,21 @@ class llama_zmq_server
                         auto& vram = get_vram_cache_manager();
 
                         if (vram.enabled(gpu_id)) {
-                            if (!vram.get_tensor(gpu_id, matrixA.base_file_name)) {
+                            ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
+                            if (!a_t && has_a_data) {
                                 vram.cache_tensor_f32_4d(
                                     gpu_id,
                                     matrixA.base_file_name,
                                     matrixA.data->data(),
                                     cols, rows, depth, batch
                                 );
+                                a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
                             }
 
-                            ggml_tensor* a_t = vram.get_tensor(gpu_id, matrixA.base_file_name);
-
                             if (a_t) {
-                                result = matrix_backend_llama.matrix_op_nd(
-                                    nullptr, nullptr,
-                                    nullptr, nullptr,
+                                result = matrix_backend_llama.matrix_op_nd_tensors(
+                                    a_t,
+                                    nullptr,
                                     backend,
                                     operation_type
                                 );
@@ -4485,6 +4523,11 @@ class llama_zmq_server
 
                     // ---------------- Host fallback ----------------
                     if (!result.data) {
+                        if (!has_a_data) {
+                            throw std::runtime_error(
+                                "Missing matrix data for transformer operation (VRAM cache miss)"
+                            );
+                        }
 
                         const float* a_ptr = matrixA.data->data();
                         std::unique_ptr<float[]> a_tmp;
@@ -4603,9 +4646,9 @@ class llama_zmq_server
                     throw std::runtime_error("flash_attn only implemented for llama/torch backend");  
                 }  
         
-                if (!matrixQ.data || !matrixK.data || !matrixV.data) {  
-                    throw std::runtime_error("Missing matrix data for flash_attn inputs");  
-                }  
+                const bool has_q_data = (matrixQ.data && !matrixQ.data->empty());
+                const bool has_k_data = (matrixK.data && !matrixK.data->empty());
+                const bool has_v_data = (matrixV.data && !matrixV.data->empty());
         
                 // ---------------- Output filename ----------------  
                 auto strip_bin = [](std::string& name) {  
@@ -4715,6 +4758,7 @@ class llama_zmq_server
                         auto cache_tensor_if_needed = [&](const matrix_shard_object& mat) {  
                             if (!vram.enabled(gpu_id)) return;  
                             if (vram.get_tensor(gpu_id, mat.base_file_name)) return;  
+                            if (!mat.data || mat.data->empty()) return;
         
                             vram.cache_tensor_f32_4d(  
                                 gpu_id,  
@@ -4747,6 +4791,9 @@ class llama_zmq_server
         
                 // ---------------- Host fallback ----------------  
                 if (!result.data) {
+                    if (!has_q_data || !has_k_data || !has_v_data) {
+                        throw std::runtime_error("Missing matrix data for flash_attn inputs (VRAM cache miss)");
+                    }
                     // Host fallback: force F32 tensors to avoid re-quantization/stride issues.
                     const ggml_type host_type = GGML_TYPE_F32;
                     int colsQ = matrixQ.cols_A, rowsQ = matrixQ.rows_A, depthQ = matrixQ.depthA, batchQ = matrixQ.batchA;
