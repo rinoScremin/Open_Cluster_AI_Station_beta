@@ -76,6 +76,7 @@ struct matrix_shard_object
     int depthA = 1;
     std::shared_ptr<std::vector<float>> data;
     int output_dtype_tag = -1; // -1 float32, -2 float16, -3 bfloat16
+    bool vram_only = false;    // true when tensor is cached in VRAM without a CPU copy
 };
 
 static inline uint16_t float_to_bf16_bits(float f) {
