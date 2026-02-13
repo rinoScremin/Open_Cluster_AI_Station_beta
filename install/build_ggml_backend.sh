@@ -4,6 +4,7 @@ IFS=$'\n\t'
 trap 'echo "❌ ggml backend build failed at line $LINENO. See logs above." >&2' ERR
 
 sudo apt install libopenblas-dev
+sudo apt install ssh
 sudo apt install pkg-config
 sudo apt install \
   libvulkan-dev \
