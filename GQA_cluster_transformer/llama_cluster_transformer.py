@@ -957,13 +957,51 @@ class llama_cluster_transformer:
                 save_bin_matrix=False
             )
 
-            _, Q_weight = self.model.q_proj_list[layer_index]
-            _, K_weight = self.model.k_proj_list[layer_index]
-            _, V_weight = self.model.v_proj_list[layer_index]
-            _, O_weight = self.model.o_proj_list[layer_index]
-            _, hidden_up_weight = self.model.mlp_up_list[layer_index]
-            _, hidden_down_weight = self.model.mlp_down_list[layer_index]
-            _, hidden_gate_weight = self.model.mlp_gate_list[layer_index]
+            Q_weight = cluster_matrix(
+                self.model.q_proj_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"],
+                save_bin_matrix=False
+            )
+
+            K_weight = cluster_matrix(
+                self.model.k_proj_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"],
+                save_bin_matrix=False
+            )
+
+            V_weight = cluster_matrix(
+                self.model.v_proj_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"]
+            )
+
+            O_weight = cluster_matrix(
+                self.model.o_proj_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"]
+            )
 
             q_cluster = x_norm_cluster.cluster_shard_operation(Q_weight, False, False, True)
             k_cluster = x_norm_cluster.cluster_shard_operation(K_weight, False, False, True)
@@ -1117,6 +1155,41 @@ class llama_cluster_transformer:
                 save_bin_matrix=False
             )
 
+            hidden_up_weight = cluster_matrix(
+                self.model.mlp_up_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"],
+                save_bin_matrix=False
+            )
+
+            hidden_down_weight = cluster_matrix(
+                self.model.mlp_down_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"]
+            )
+
+            hidden_gate_weight = cluster_matrix(
+                self.model.mlp_gate_list[layer_index],
+                cluster_zmq_object=self.model.cluster_zmq_object,
+                CPU_GPU_select_list=self.model.CPU_GPU_select_list,
+                node_percentages=self.model.percentages,
+                back_end_select_list=self.model.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "load"],
+                save_bin_matrix=False
+            )
+
             # ---- MLP ----
             hidden_up_cluster = x_cluster.cluster_shard_operation(hidden_up_weight, False, False, True)
             hidden_gate_cluster = x_cluster.cluster_shard_operation(hidden_gate_weight, False, False, True)
@@ -1238,6 +1311,7 @@ def main():
     
     llama_test = llama_cluster_transformer(Tokenizer_test, model)
 
+    
     def _clean_reply(text: str) -> str:
         for tok in ("<|assistant|>", "<|user|>", "<|system|>", "</s>"):
             text = text.replace(tok, "")
@@ -1270,7 +1344,8 @@ def main():
         reply = _clean_reply(outputs[0]) if outputs else ""
         history.append(("assistant", reply))
         print(f"assistant: {reply}")
+    
 
 
-#if __name__ == "__main__":
-#    main()
+if __name__ == "__main__":
+    main()
