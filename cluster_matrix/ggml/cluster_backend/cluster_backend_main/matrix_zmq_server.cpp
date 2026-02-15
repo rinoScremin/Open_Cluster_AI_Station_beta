@@ -140,6 +140,39 @@ std::string get_local_ip()
     }
 }
 
+// Best-effort WiFi IP detection: return empty string if not found.
+std::string get_wifi_ip()
+{
+    try
+    {
+        // List IPv4 interfaces and CIDRs; pick likely WiFi interface names (wl*, wlan*, wifi*).
+        std::string out = exec_command("ip -o -4 addr show | awk '{print $2, $4}'");
+        std::istringstream iss(out);
+        std::string iface;
+        std::string cidr;
+        while (iss >> iface >> cidr)
+        {
+            if (iface.rfind("wl", 0) == 0 ||
+                iface.rfind("wlan", 0) == 0 ||
+                iface.find("wifi") != std::string::npos)
+            {
+                const auto slash = cidr.find('/');
+                std::string ip = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
+                if (!ip.empty())
+                {
+                    return ip;
+                }
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Warning: Failed to get WiFi IP: " << e.what() << std::endl;
+    }
+
+    return "";
+}
+
 std::string get_env(const char* env_var, const char* default_val) 
 {
     const char* env_value = std::getenv(env_var);
@@ -205,6 +238,7 @@ class llama_zmq_server
         std::string wifi_pull_port;
         std::string wifi_push_port;
         std::string worker_peer_port;
+        bool wifi_available = false;
         
         zmq::context_t zmq_context;
         zmq::socket_t file_receiver_eth;
@@ -765,50 +799,54 @@ class llama_zmq_server
             // Get local network addresses
             local_IP_eth = get_local_ip();
             
-            // Attempt to get WiFi IP address using system command
-            try {
-                local_IP_wifi = exec_command(
-                    "ip -4 addr show $(ip -4 route ls | grep default | grep -o 'dev [^ ]*' "
-                    "| awk '{print $2}') | grep inet | awk '{print $2}' | cut -d'/' -f1"
-                );
-                // Clean up newline from command output
-                if (!local_IP_wifi.empty() && local_IP_wifi[local_IP_wifi.length()-1] == '\n') {
-                    local_IP_wifi.erase(local_IP_wifi.length()-1);
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: Failed to get WiFi IP: " << e.what() << std::endl;
-                local_IP_wifi = "127.0.0.1";
+            // Attempt to get WiFi IP address (if a WiFi interface exists).
+            local_IP_wifi = get_wifi_ip();
+            wifi_available = !local_IP_wifi.empty();
+            if (!wifi_available) {
+                local_IP_wifi.clear();
             }
             
             // Configure network ports based on whether this is head node or worker node
-            if (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi) {
+            if (local_IP_eth == head_node_ip_eth || (wifi_available && local_IP_wifi == head_node_ip_wifi)) {
                 // Head node configuration
                 eth_pull_port = "tcp://" + local_IP_eth + ":" + head_node_PULL_port;
                 eth_push_port = "tcp://" + local_IP_eth + ":" + head_node_PUSH_port;
-                wifi_pull_port = "tcp://" + local_IP_wifi + ":" + head_node_PULL_port;
-                wifi_push_port = "tcp://" + local_IP_wifi + ":" + head_node_PUSH_port;
+                if (wifi_available) {
+                    wifi_pull_port = "tcp://" + local_IP_wifi + ":" + head_node_PULL_port;
+                    wifi_push_port = "tcp://" + local_IP_wifi + ":" + head_node_PUSH_port;
+                }
             } else {
                 // Worker node configuration
                 eth_pull_port = "tcp://" + local_IP_eth + ":" + worker_node_PULL_port;
                 eth_push_port = "tcp://" + local_IP_eth + ":" + worker_node_PUSH_port;
-                wifi_pull_port = "tcp://" + local_IP_wifi + ":" + worker_node_PULL_port;
-                wifi_push_port = "tcp://" + local_IP_wifi + ":" + worker_node_PUSH_port;
+                if (wifi_available) {
+                    wifi_pull_port = "tcp://" + local_IP_wifi + ":" + worker_node_PULL_port;
+                    wifi_push_port = "tcp://" + local_IP_wifi + ":" + worker_node_PUSH_port;
+                }
             }
             
             // Bind file transfer sockets
             file_receiver_eth.bind(eth_pull_port);
             file_sender_eth.bind(eth_push_port);
-            file_receiver_wifi.bind(wifi_pull_port);
-            file_sender_wifi.bind(wifi_push_port);
+            if (wifi_available) {
+                file_receiver_wifi.bind(wifi_pull_port);
+                file_sender_wifi.bind(wifi_push_port);
+            }
             
 	            // Connect to head node for coordination
 	            head_node_sender_eth.connect("tcp://" + head_node_ip_eth + ":" + head_node_PULL_port);
-	            head_node_sender_wifi.connect("tcp://" + head_node_ip_wifi + ":" + head_node_PULL_port);
+	            if (wifi_available) {
+	                head_node_sender_wifi.connect("tcp://" + head_node_ip_wifi + ":" + head_node_PULL_port);
+	            }
 	            // Prevent indefinite blocking on send if the head isn't reachable/reading.
 	            head_node_sender_eth.set(zmq::sockopt::linger, 0);
-	            head_node_sender_wifi.set(zmq::sockopt::linger, 0);
+	            if (wifi_available) {
+	                head_node_sender_wifi.set(zmq::sockopt::linger, 0);
+	            }
 	            head_node_sender_eth.set(zmq::sockopt::sndtimeo, 10000);
-	            head_node_sender_wifi.set(zmq::sockopt::sndtimeo, 10000);
+	            if (wifi_available) {
+	                head_node_sender_wifi.set(zmq::sockopt::sndtimeo, 10000);
+	            }
             
             // Setup Python front-end ACK communication
             std::string python_frontend_ip = get_env("HEAD_NODE_IP", "192.168.2.100");
@@ -835,18 +873,25 @@ class llama_zmq_server
             
             worker_peer_port = get_env("WORKER_PEER_PORT", "5560");
             worker_peer_receiver.bind("tcp://" + local_IP_eth + ":" + worker_peer_port);
-            worker_peer_receiver.bind("tcp://" + local_IP_wifi + ":" + worker_peer_port);
+            if (wifi_available) {
+                worker_peer_receiver.bind("tcp://" + local_IP_wifi + ":" + worker_peer_port);
+            }
             
             // Clean console output
             std::cout << "\n=== ZMQ Server Initialization ===" << std::endl;
             std::cout << "Network Configuration:" << std::endl;
             std::cout << "  Ethernet IP: " << local_IP_eth << std::endl;
-            std::cout << "  WiFi IP: " << local_IP_wifi << std::endl;
+            std::cout << "  WiFi IP: " << (wifi_available ? local_IP_wifi : "Unavailable") << std::endl;
             std::cout << "\nPort Bindings:" << std::endl;
             std::cout << "  Ethernet PULL: " << eth_pull_port << std::endl;
             std::cout << "  Ethernet PUSH: " << eth_push_port << std::endl;
-            std::cout << "  WiFi PULL: " << wifi_pull_port << std::endl;
-            std::cout << "  WiFi PUSH: " << wifi_push_port << std::endl;
+            if (wifi_available) {
+                std::cout << "  WiFi PULL: " << wifi_pull_port << std::endl;
+                std::cout << "  WiFi PUSH: " << wifi_push_port << std::endl;
+            } else {
+                std::cout << "  WiFi PULL: (disabled)" << std::endl;
+                std::cout << "  WiFi PUSH: (disabled)" << std::endl;
+            }
             std::cout << "  Worker Peer: " << worker_peer_port << std::endl;
             std::cout << "  Worker IPs configured: " << worker_ip_list.size() << " nodes" << std::endl;
             
@@ -999,7 +1044,7 @@ class llama_zmq_server
             
             std::cout << "✅ Network listeners started successfully" << std::endl;
             std::cout << "   • Ethernet interface: Active" << std::endl;
-            std::cout << "   • WiFi interface: Active" << std::endl;
+            std::cout << "   • WiFi interface: " << (wifi_available ? "Active" : "Unavailable") << std::endl;
             std::cout << "   • Command processor: Active" << std::endl;
             std::cout << "\n📡 Server running. Press Ctrl+C to gracefully shutdown..." << std::endl;
             
@@ -2225,7 +2270,7 @@ class llama_zmq_server
 	                if (is_sent_back)
 	                {
 	                    // Worker result shard streamed to head for combining.
-	                    const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
+                    const bool is_head_node = (local_IP_eth == head_node_ip_eth || (wifi_available && local_IP_wifi == head_node_ip_wifi));
 	                    if (!is_head_node) {
 	                        return;
 	                    }
@@ -2380,7 +2425,7 @@ class llama_zmq_server
 	                            int output_dtype_tag)
         {
             std::cout << "SENDING BACK FILE" << std::endl;
-            bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
+            bool is_head_node = (local_IP_eth == head_node_ip_eth || (wifi_available && local_IP_wifi == head_node_ip_wifi));
 
             // ============================================================
             // WORKER NODE → STREAM RESULT BACK TO HEAD (NO DISK)
@@ -2407,7 +2452,7 @@ class llama_zmq_server
 	                    output_dtype_tag      // -1 f32, -2 fp16, -3 bf16
 	                );
 
-	                if (!ok)
+	                if (!ok && wifi_available)
 	                {
 	                    ok = stream_matrix_binary(
 	                        head_node_sender_wifi,
@@ -4672,7 +4717,7 @@ class llama_zmq_server
                 const std::string base_result = q_name + "x" + k_name + "x" + v_name;  
         
                 // Mark this base as requiring FlashAttention-aware combine on the head node.  
-                const bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);  
+                const bool is_head_node = (local_IP_eth == head_node_ip_eth || (wifi_available && local_IP_wifi == head_node_ip_wifi));  
                 if (is_head_node && send_back != 0) {  
                     std::lock_guard<std::mutex> lock(flash_atten_openartion_combine_mutex);  
                     flash_atten_openartion_combine_list.insert(base_result);  
