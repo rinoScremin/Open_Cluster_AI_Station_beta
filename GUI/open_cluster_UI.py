@@ -55,6 +55,8 @@ class ClusterTransformerUI:
         self.model_ready = False
         self.system = "You are a helpful assistant."
         self.special_token_ids = set()
+        self.is_generating = False
+        self.send_button = None
 
         self.max_gen_len = 128
         self.temperature = 0.8
@@ -169,6 +171,11 @@ class ClusterTransformerUI:
             self.model_action = None
 
     def send_message(self):
+        if self.is_generating:
+            if self.cluster_transformer is not None:
+                self.cluster_transformer.request_stop()
+            return
+
         text = self.user_input.value.strip()
         if not text:
             return
@@ -193,8 +200,13 @@ class ClusterTransformerUI:
         self.messages.append(('user', text))
         token_queue = queue.Queue()
         stream_state = {'done': False, 'error': None, 'text': ''}
+        self.is_generating = True
+        self._set_send_button_state(is_generating=True)
+        stream_token_ids: list[int] = []
+        last_decoded = ''
 
         def on_token(batch, token_id, token_text):
+            nonlocal last_decoded
             if batch != 0:
                 return
             try:
@@ -202,30 +214,23 @@ class ClusterTransformerUI:
                     return
             except Exception:
                 pass
-            text_piece = token_text or ''
             try:
-                sp = self.cluster_transformer.tokenizer.sp_model
-                piece = sp.id_to_piece(int(token_id))
-                if piece in ('<s>', '</s>', '<unk>'):
-                    text_piece = ''
-                elif piece.startswith('▁'):
-                    text_piece = ' ' + piece[1:]
+                stream_token_ids.append(int(token_id))
+                decoded = self.cluster_transformer.tokenizer.decode(stream_token_ids)
+                if decoded.startswith(last_decoded):
+                    new_text = decoded[len(last_decoded):]
                 else:
-                    text_piece = piece
-                text_piece = text_piece.replace('▁', ' ')
-                text_piece = text_piece.replace('<0x0A>', '\n')
+                    new_text = decoded
+                new_text = new_text.replace('<0x0A>', '\n')
+                if new_text:
+                    token_queue.put(new_text)
+                last_decoded = decoded
+                return
             except Exception:
-                # Fallback: strip known special tokens when using HF tokenizers.
-                specials = [
-                    getattr(self.cluster_transformer, 'eos_token_text', None),
-                    getattr(self.cluster_transformer, 'eot_token_text', None),
-                    getattr(self.cluster_transformer, 'bos_token_text', None),
-                    getattr(self.cluster_transformer, 'pad_token_text', None),
-                ]
-                if text_piece in [s for s in specials if isinstance(s, str)]:
-                    text_piece = ''
-            if text_piece:
-                text_piece = text_piece.replace('<0x0A>', '\n')
+                pass
+
+            # Fallback to token_text if full decode fails.
+            text_piece = (token_text or '').replace('<0x0A>', '\n')
             if text_piece:
                 token_queue.put(text_piece)
 
@@ -263,6 +268,8 @@ class ClusterTransformerUI:
                 else:
                     if stream_state['text']:
                         self.messages.append(('assistant', stream_state['text']))
+                self.is_generating = False
+                self._set_send_button_state(is_generating=False)
                 token_timer.cancel()
 
         token_timer = ui.timer(0.05, _flush_tokens)
@@ -332,6 +339,14 @@ class ClusterTransformerUI:
         self.system = str(value)
         if self.cluster_transformer is not None and hasattr(self.cluster_transformer, 'system'):
             self.cluster_transformer.system = self.system
+
+    def _set_send_button_state(self, is_generating: bool):
+        if self.send_button is None:
+            return
+        if is_generating:
+            self.send_button.set_text('Stop')
+        else:
+            self.send_button.set_text('Send')
 
     def _add_node_ui(self, ip, percentage=0.1, backend='llama', device='GPU'):
         self.IP_list.append(ip)
@@ -689,7 +704,7 @@ class ClusterTransformerUI:
                     placeholder='Type your message...'
                 ).classes('flex-grow chat-input')
 
-                ui.button('Send', on_click=self.send_message)
+                self.send_button = ui.button('Send', on_click=self.send_message)
                 self.user_input.on('keydown.enter', self.send_message)
 
         ui.timer(0.5, self._consume_pending_path)
