@@ -54,6 +54,7 @@ class ClusterTransformerUI:
         self.msg_counter = 0
         self.model_ready = False
         self.system = "You are a helpful assistant."
+        self.special_token_ids = set()
 
         self.max_gen_len = 128
         self.temperature = 0.8
@@ -87,6 +88,9 @@ class ClusterTransformerUI:
         if hasattr(self, 'progress_label'):
             self.progress_label.set_text(f'{saveOrLoad.title()} in progress...')
 
+        # Apply generation defaults from generation_config.json (if available).
+        self._apply_model_generation_settings(self.selected_model_path)
+
         def _run():
             try:
                 cluster_zmq_obj = cluster_zmq(self.IP_list)
@@ -99,12 +103,12 @@ class ClusterTransformerUI:
                 )
 
                 self.ui_model.cache_model_tensors(saveOrload=saveOrLoad)
-                tokenizer_path = os.path.join(self.selected_model_path, 'tokenizer.model')
-                if not os.path.isfile(tokenizer_path):
-                    print(f"tokenizer.model not found in {self.selected_model_path}")
-                    tokenizer_path = self.selected_model_path
-                self.Tokenizer = Tokenizer(tokenizer_path)
+                self.Tokenizer = Tokenizer(self.selected_model_path)
                 self.cluster_transformer = llama_cluster_transformer(self.Tokenizer, self.ui_model)
+                self.cluster_transformer.system = self.system
+                model_specials = getattr(self.ui_model, 'special_token_ids', None)
+                if model_specials:
+                    self.special_token_ids = set(int(x) for x in model_specials if isinstance(x, int))
                 self.model_error = None
                 self.model_ready = True
             except Exception as exc:
@@ -193,6 +197,11 @@ class ClusterTransformerUI:
         def on_token(batch, token_id, token_text):
             if batch != 0:
                 return
+            try:
+                if token_id in self.special_token_ids:
+                    return
+            except Exception:
+                pass
             text_piece = token_text or ''
             try:
                 sp = self.cluster_transformer.tokenizer.sp_model
@@ -206,7 +215,15 @@ class ClusterTransformerUI:
                 text_piece = text_piece.replace('▁', ' ')
                 text_piece = text_piece.replace('<0x0A>', '\n')
             except Exception:
-                pass
+                # Fallback: strip known special tokens when using HF tokenizers.
+                specials = [
+                    getattr(self.cluster_transformer, 'eos_token_text', None),
+                    getattr(self.cluster_transformer, 'eot_token_text', None),
+                    getattr(self.cluster_transformer, 'bos_token_text', None),
+                    getattr(self.cluster_transformer, 'pad_token_text', None),
+                ]
+                if text_piece in [s for s in specials if isinstance(s, str)]:
+                    text_piece = ''
             if text_piece:
                 text_piece = text_piece.replace('<0x0A>', '\n')
             if text_piece:
@@ -274,6 +291,40 @@ class ClusterTransformerUI:
         if hasattr(e, 'sender') and hasattr(e.sender, 'value'):
             return e.sender.value
         return None
+
+    def _read_json(self, path: str):
+        try:
+            if not path or not os.path.exists(path):
+                return None
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _apply_model_generation_settings(self, model_dir: str):
+        if not model_dir:
+            return
+        gen = self._read_json(os.path.join(model_dir, 'generation_config.json')) or {}
+        temp = gen.get('temperature', None)
+        top_p = gen.get('top_p', None)
+        if temp is not None:
+            try:
+                self.temperature = float(temp)
+            except (TypeError, ValueError):
+                pass
+        if top_p is not None:
+            try:
+                self.top_p = float(top_p)
+            except (TypeError, ValueError):
+                pass
+
+        # Update UI inputs if they exist
+        if hasattr(self, 'temperature_input'):
+            self.temperature_input.value = str(self.temperature)
+            self.temperature_input.update()
+        if hasattr(self, 'top_p_input'):
+            self.top_p_input.value = str(self.top_p)
+            self.top_p_input.update()
 
     def _set_system(self, value):
         if value is None:
@@ -595,10 +646,10 @@ class ClusterTransformerUI:
                             ui.input(value=str(self.max_gen_len), label='Max Gen Len').props('outlined type=number step=1 min=1').classes('flex-1').on(
                                 'change', lambda e: setattr(self, 'max_gen_len', int(float(self._event_value(e))) if self._event_value(e) not in (None, '') else self.max_gen_len)
                             )
-                            ui.input(value=str(self.temperature), label='Temperature').props('outlined type=number step=0.05 min=0').classes('flex-1').on(
+                            self.temperature_input = ui.input(value=str(self.temperature), label='Temperature').props('outlined type=number step=0.05 min=0').classes('flex-1').on(
                                 'change', lambda e: setattr(self, 'temperature', float(self._event_value(e)) if self._event_value(e) not in (None, '') else self.temperature)
                             )
-                            ui.input(value=str(self.top_p), label='Top P').props('outlined type=number step=0.01 min=0 max=1').classes('flex-1').on(
+                            self.top_p_input = ui.input(value=str(self.top_p), label='Top P').props('outlined type=number step=0.01 min=0 max=1').classes('flex-1').on(
                                 'change', lambda e: setattr(self, 'top_p', float(self._event_value(e)) if self._event_value(e) not in (None, '') else self.top_p)
                             )
 
