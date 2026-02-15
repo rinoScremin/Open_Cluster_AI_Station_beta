@@ -50,9 +50,8 @@ class hugging_face_model_handler:
         self.split_system = 1
         self.split_dim = 1
         self.q_proj_shape = None
-        # Add tokenizer initialization
+        # Add tokenizer initialization (after config is read)
         self.tokenizer = None
-        self._load_tokenizer()
 
         #self.get_q_shape()
 
@@ -96,6 +95,24 @@ class hugging_face_model_handler:
         self.attention_dropout = False
         self.bos_token_id = 0
         self.eos_token_id = 0
+        self.pad_token_id = None
+        self.unk_token_id = None
+        self.bos_token = None
+        self.eos_token = None
+        self.pad_token = None
+        self.special_tokens_map = {}
+        self.tokenizer_config = {}
+        self.tokenizer_json = {}
+        self.special_token_ids = set()
+        self.start_header_id = None
+        self.end_header_id = None
+        self.eot_id = None
+        self.eom_id = None
+        self.python_tag_id = None
+        self.system_token_id = None
+        self.user_token_id = None
+        self.assistant_token_id = None
+        self._token_text_to_id = {}
         self.hidden_act = 'silu'
         self.hidden_size = None
         self.initializer_range = 0
@@ -114,10 +131,20 @@ class hugging_face_model_handler:
         self.torch_dtype = 'bfloat16'
         self.use_cache = True
         self.vocab_size = 0
+        self.generation_temperature = None
+        self.generation_top_p = None
+        self.tokenizer_style = None
 
         self.lm_head = None
 
         self.read_llama_config()
+        self.read_generation_config()
+        self.read_special_tokens_map()
+        self.read_tokenizer_config()
+        self.read_tokenizer_json()
+        self.tokenizer_style = self._detect_tokenizer_style()
+        self._load_tokenizer()
+        self._init_special_token_ids()
         self.cache_dtype = self._resolve_cache_dtype()
 
         self.save_progress = 0
@@ -213,7 +240,6 @@ class hugging_face_model_handler:
 
     def cache_model_tensors(self, saveOrload="save", split_system=1, split_dim=None):
         """Cache model tensors from safetensors files using cluster_matrix."""
-
         self.load_progress = 0
         self.save_progress = 0
         layers_seen = set()
@@ -233,14 +259,12 @@ class hugging_face_model_handler:
             print(f"📏 Auto-selected splitting dimension: {self.split_dim}")
         else:
             self.split_dim = split_dim
-
         self.split_system = split_system
 
         # ----------------- Tensor loading -----------------
         for shard_path in shard_files:
             print(f"Loading shard: {shard_path}")
             with safe_open(shard_path, framework="pt") as f:
-
                 for key in f.keys():
                     layer_idx = None
                     key_parts = key.split('.')
@@ -254,17 +278,14 @@ class hugging_face_model_handler:
                             self.save_progress += 1
                         else:
                             self.load_progress += 1
-
                     tensor = f.get_tensor(key)
                     tensor = tensor.to(self.cache_dtype)
-
                     if tensor.ndim == 1:
                         tid = self._handle_1d_tensor(
                             tensor,
                             key,
                         )
                         print(f"  ✅ 1D tensor '{key}' → {tid}")
-
                     elif tensor.ndim == 2:
                         tid = self._handle_2d_tensor(
                             tensor,
@@ -274,11 +295,6 @@ class hugging_face_model_handler:
                         )
                         print(f"  ✅ 2D tensor '{key}' → {tid}")
                         key_split = key.split('.')
-                        #for key_words in key_split:
-                            #if key_words == '0':
-                                #torch.save(tensor,key)
-                        
-
                     else:
                         cm, shard_shapes = self.wrap_cluster_matrix(
                             tensor,
@@ -291,7 +307,6 @@ class hugging_face_model_handler:
                         self.other_list.append((key, tensor.shape, shard_shapes))
                         print(f"  ⚠️ Higher-rank tensor '{key}'")
 
-        
         self.sort_llama_weights()
         self.sort_norms()
 
@@ -351,7 +366,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'q_proj_list'):
                 self.q_proj_list = []
-            self.q_proj_list.append((key, cm))
+            self.q_proj_list.append(key)
             return 'q'
 
         elif 'k_proj' in key_lower and 'bias' not in key_lower:
@@ -367,7 +382,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'k_proj_list'):
                 self.k_proj_list = []
-            self.k_proj_list.append((key, cm))
+            self.k_proj_list.append(key)
             return 'k'
 
         elif 'v_proj' in key_lower and 'bias' not in key_lower:
@@ -383,7 +398,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'v_proj_list'):
                 self.v_proj_list = []
-            self.v_proj_list.append((key, cm))
+            self.v_proj_list.append(key)
             return 'v'
 
         elif 'o_proj' in key_lower and 'bias' not in key_lower:
@@ -402,7 +417,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'o_proj_list'):
                 self.o_proj_list = []
-            self.o_proj_list.append((key, cm))
+            self.o_proj_list.append(key)
             return 'o'
 
 
@@ -418,7 +433,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_up_list'):
                 self.mlp_up_list = []
-            self.mlp_up_list.append((key, cm))
+            self.mlp_up_list.append(key)
             return 'up'
 
         elif 'down_proj' in key_lower or 'w2' in key_lower or 'fc2' in key_lower:
@@ -432,7 +447,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_down_list'):
                 self.mlp_down_list = []
-            self.mlp_down_list.append((key, cm))
+            self.mlp_down_list.append(key)
             return 'down'
 
         elif 'gate_proj' in key_lower or 'w1' in key_lower or 'fc1' in key_lower:
@@ -446,7 +461,7 @@ class hugging_face_model_handler:
             )
             if not hasattr(self, 'mlp_gate_list'):
                 self.mlp_gate_list = []
-            self.mlp_gate_list.append((key, cm))
+            self.mlp_gate_list.append(key)
             return 'gate'
 
 
@@ -620,6 +635,235 @@ class hugging_face_model_handler:
         except Exception as e:
             print(f"❌ Error reading config file: {e}")
             return False
+
+    def read_generation_config(self) -> bool:
+        """
+        Read generation_config.json to pick default sampling parameters.
+        """
+        gen_path = os.path.join(self.model_path, "generation_config.json")
+        if not os.path.exists(gen_path):
+            return False
+        try:
+            with open(gen_path, "r") as f:
+                gen = json.load(f)
+            self.generation_temperature = gen.get("temperature", None)
+            self.generation_top_p = gen.get("top_p", None)
+            return True
+        except Exception as e:
+            print(f"❌ Error reading generation_config.json: {e}")
+            return False
+
+    def read_special_tokens_map(self) -> bool:
+        """
+        Read special_tokens_map.json to get BOS/EOS/PAD tokens.
+        """
+        tok_path = os.path.join(self.model_path, "special_tokens_map.json")
+        if not os.path.exists(tok_path):
+            return False
+        try:
+            with open(tok_path, "r") as f:
+                data = json.load(f)
+            self.special_tokens_map = data
+            self.special_tokens = data
+            def _token_text(val):
+                if isinstance(val, dict):
+                    if "content" in val:
+                        return val.get("content")
+                    if "token" in val:
+                        return val.get("token")
+                    if "text" in val:
+                        return val.get("text")
+                    return None
+                return val
+
+            self.bos_token = _token_text(data.get("bos_token")) or self.bos_token
+            self.eos_token = _token_text(data.get("eos_token")) or self.eos_token
+            self.pad_token = _token_text(data.get("pad_token")) or self.pad_token
+            return True
+        except Exception as e:
+            print(f"❌ Error reading special_tokens_map.json: {e}")
+            return False
+
+    def read_tokenizer_config(self) -> bool:
+        """
+        Read tokenizer_config.json (chat template, added tokens, etc).
+        """
+        tok_cfg = os.path.join(self.model_path, "tokenizer_config.json")
+        if not os.path.exists(tok_cfg):
+            return False
+        try:
+            with open(tok_cfg, "r", encoding="utf-8") as f:
+                self.tokenizer_config = json.load(f)
+            # Build text->id map from added_tokens_decoder if present.
+            decoder = self.tokenizer_config.get("added_tokens_decoder", {}) or {}
+            for k, v in decoder.items():
+                try:
+                    tok_id = int(k)
+                except Exception:
+                    continue
+                if isinstance(v, dict):
+                    text = v.get("content") or v.get("token") or v.get("text")
+                else:
+                    text = v
+                if isinstance(text, str) and text:
+                    self._token_text_to_id[text] = tok_id
+            # If no chat_template in tokenizer_config, fall back to chat_template.jinja.
+            if not self.tokenizer_config.get("chat_template"):
+                jinja_path = os.path.join(self.model_path, "chat_template.jinja")
+                if os.path.exists(jinja_path):
+                    try:
+                        with open(jinja_path, "r", encoding="utf-8") as jf:
+                            jinja_template = jf.read()
+                        if jinja_template.strip():
+                            self.tokenizer_config["chat_template"] = jinja_template
+                    except Exception:
+                        pass
+            return True
+        except Exception as e:
+            print(f"❌ Error reading tokenizer_config.json: {e}")
+            return False
+
+    def read_tokenizer_json(self) -> bool:
+        """
+        Optionally read tokenizer.json into a dict.
+        """
+        tok_json = os.path.join(self.model_path, "tokenizer.json")
+        if not os.path.exists(tok_json):
+            return False
+        try:
+            with open(tok_json, "r", encoding="utf-8") as f:
+                self.tokenizer_json = json.load(f)
+            return True
+        except Exception as e:
+            print(f"❌ Error reading tokenizer.json: {e}")
+            return False
+
+    def _token_id_from_text(self, text: Optional[str]) -> Optional[int]:
+        if not text or not isinstance(text, str):
+            return None
+        if text in self._token_text_to_id:
+            return int(self._token_text_to_id[text])
+        if self.tokenizer is not None:
+            try:
+                if hasattr(self.tokenizer, "convert_tokens_to_ids"):
+                    tid = self.tokenizer.convert_tokens_to_ids(text)
+                    if isinstance(tid, int) and tid >= 0:
+                        return tid
+            except Exception:
+                pass
+            try:
+                ids = self.tokenizer.encode(text, add_special_tokens=False)
+                if isinstance(ids, list) and len(ids) == 1:
+                    return int(ids[0])
+            except Exception:
+                pass
+        return None
+
+    def _init_special_token_ids(self) -> None:
+        """
+        Convert special token strings into token IDs for runtime use.
+        """
+        # Prefer IDs already in config.json.
+        if self.bos_token_id is None:
+            self.bos_token_id = self._token_id_from_text(self.bos_token)
+        if self.eos_token_id is None:
+            self.eos_token_id = self._token_id_from_text(self.eos_token)
+        if self.pad_token_id is None:
+            self.pad_token_id = self._token_id_from_text(self.pad_token)
+        if self.unk_token_id is None and self.tokenizer is not None:
+            self.unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
+
+        # Llama-3 style tokens (from tokenizer_config added_tokens_decoder)
+        self.start_header_id = self._token_id_from_text("<|start_header_id|>")
+        self.end_header_id = self._token_id_from_text("<|end_header_id|>")
+        self.eot_id = self._token_id_from_text("<|eot_id|>")
+        self.eom_id = self._token_id_from_text("<|eom_id|>")
+        self.python_tag_id = self._token_id_from_text("<|python_tag|>")
+
+        # Llama-2 style roles (if present)
+        self.system_token_id = self._token_id_from_text("<|system|>")
+        self.user_token_id = self._token_id_from_text("<|user|>")
+        self.assistant_token_id = self._token_id_from_text("<|assistant|>")
+
+        ids = set()
+        for tid in (
+            self.bos_token_id,
+            self.eos_token_id,
+            self.pad_token_id,
+            self.unk_token_id,
+            self.start_header_id,
+            self.end_header_id,
+            self.eot_id,
+            self.eom_id,
+            self.python_tag_id,
+            self.system_token_id,
+            self.user_token_id,
+            self.assistant_token_id,
+        ):
+            if isinstance(tid, int) and tid >= 0:
+                ids.add(int(tid))
+        self.special_token_ids = ids
+
+    def add_chat_template(
+        self,
+        messages_or_prompt,
+        system_prompt: Optional[str] = None,
+        add_generation_prompt: bool = True,
+        tokenize: bool = False,
+    ) -> Optional[Union[str, List[int], dict]]:
+        """
+        Render chat template using tokenizer_config.json / tokenizer if available.
+        """
+        if self.tokenizer is None or not hasattr(self.tokenizer, "apply_chat_template"):
+            return None
+
+        if isinstance(messages_or_prompt, str):
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": messages_or_prompt})
+        else:
+            messages = [{"role": r, "content": c} for r, c in messages_or_prompt]
+            if system_prompt and not any(m.get("role") == "system" for m in messages):
+                messages = [{"role": "system", "content": system_prompt}] + messages
+
+        # Ensure tokenizer has chat_template if provided in tokenizer_config.json.
+        chat_template = self.tokenizer_config.get("chat_template")
+        if chat_template and not getattr(self.tokenizer, "chat_template", None):
+            self.tokenizer.chat_template = chat_template
+
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=bool(tokenize),
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception:
+            return None
+
+    def _detect_tokenizer_style(self) -> str:
+        """
+        Determine tokenizer style from config + files.
+        Returns: "sentencepiece", "tokenizer_json", or "auto".
+        """
+        cfg = getattr(self, "config", {}) or {}
+        tokenizer_class = str(cfg.get("tokenizer_class", "") or "")
+
+        has_sp = os.path.isfile(os.path.join(self.model_path, "tokenizer.model"))
+        has_json = os.path.isfile(os.path.join(self.model_path, "tokenizer.json"))
+
+        if "LlamaTokenizer" in tokenizer_class and "Fast" not in tokenizer_class:
+            return "sentencepiece"
+        if "Fast" in tokenizer_class:
+            return "tokenizer_json"
+        if has_json and not has_sp:
+            return "tokenizer_json"
+        if has_sp and not has_json:
+            return "sentencepiece"
+        if has_sp and has_json:
+            # Prefer config hint; otherwise default to tokenizer.json for newer models.
+            return "tokenizer_json" if tokenizer_class == "" else "sentencepiece"
+        return "auto"
     
     def _print_llama_config_summary(self):
         """Print a formatted summary of the Llama configuration"""
@@ -664,15 +908,22 @@ class hugging_face_model_handler:
         """
         try:
             model_dir = self.model_path
-            # Use the LLaMA tokenizer explicitly
-            self.tokenizer = LlamaTokenizer.from_pretrained(
-                model_dir,
-                local_files_only=True
-            )
-            print(f"✅ Correct LLaMA tokenizer loaded from {model_dir}")
-            print(f"Vocabulary size: {self.tokenizer.vocab_size}")
+            style = self.tokenizer_style or "auto"
+            if style == "sentencepiece":
+                self.tokenizer = LlamaTokenizer.from_pretrained(
+                    model_dir,
+                    local_files_only=True
+                )
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_dir,
+                    local_files_only=True
+                )
+            print(f"✅ Tokenizer loaded from {model_dir} (style={style})")
+            if hasattr(self.tokenizer, "vocab_size"):
+                print(f"Vocabulary size: {self.tokenizer.vocab_size}")
         except Exception as e:
-            print(f"❌ Failed to load LLaMA tokenizer: {e}")
+            print(f"❌ Failed to load tokenizer: {e}")
             self.tokenizer = None
 
     # ----------------- TENSOR SORTING & INFO -----------------
