@@ -573,15 +573,33 @@ class llama_cluster_transformer:
 
         if stop_words is not None:
             do_stop = [False for _ in range(len(tokens))]
-            for i, (t, p) in enumerate(zip(tokens, prompt_tokens)):
-                t = t.clone()
-                g = t[len(p):]
-                g[g == self.tokenizer.pad_id] = self.tokenizer.eos_id
-                g = g.tolist()
-                d = self.tokenizer.decode(g)
-                for stop_word in stop_words:
-                    if stop_word in d:
-                        do_stop[i] = True
+            if stop_words and isinstance(stop_words[0], (list, tuple)):
+                # Token-ID stop sequences (preferred: no string decoding).
+                for i, (t, p) in enumerate(zip(tokens, prompt_tokens)):
+                    g = t[len(p):].tolist()
+                    for stop_seq in stop_words:
+                        if not stop_seq:
+                            continue
+                        seq = list(stop_seq)
+                        n = len(seq)
+                        for j in range(0, max(0, len(g) - n + 1)):
+                            if g[j:j + n] == seq:
+                                do_stop[i] = True
+                                break
+                        if do_stop[i]:
+                            break
+            else:
+                # Fallback: string stop words.
+                for i, (t, p) in enumerate(zip(tokens, prompt_tokens)):
+                    t = t.clone()
+                    g = t[len(p):]
+                    g[g == self.tokenizer.pad_id] = self.tokenizer.eos_id
+                    g = g.tolist()
+                    d = self.tokenizer.decode(g)
+                    for stop_word in stop_words:
+                        if stop_word in d:
+                            do_stop[i] = True
+                            break
 
             if all(do_stop):
                 return True
@@ -611,7 +629,7 @@ class llama_cluster_transformer:
         # Reset cache once per generation call (prevents cross-prompt leakage).
         self.clear_kv_cache()
 
-        def format_prompt(p: str) -> str:
+        def format_prompt_legacy(p: str) -> str:
             model_name = str(getattr(self.model, "model_name", "")).lower()
             model_path = str(getattr(self.model, "model_path", "")).lower()
             if "chat" in model_name or "chat" in model_path:
@@ -619,7 +637,7 @@ class llama_cluster_transformer:
                 return f"<|system|>\n{self.system}{eos}\n<|user|>\n{p}{eos}\n<|assistant|>"
             return p
 
-        def format_messages(msgs: List[tuple]) -> str:
+        def format_messages_legacy(msgs: List[tuple]) -> str:
             eos = "</s>"
             parts: List[str] = []
             has_system = any(role == "system" for role, _ in msgs)
@@ -633,6 +651,22 @@ class llama_cluster_transformer:
             parts.append("<|assistant|>")
             return "\n".join(parts)
 
+        def render_prompt(obj) -> str:
+            if hasattr(self.model, "add_chat_template"):
+                try:
+                    rendered = self.model.add_chat_template(
+                        obj,
+                        system_prompt=self.system,
+                        add_generation_prompt=True,
+                    )
+                    if isinstance(rendered, str) and rendered:
+                        return rendered
+                except Exception:
+                    pass
+            if isinstance(obj, str):
+                return format_prompt_legacy(obj)
+            return format_messages_legacy(obj)
+
         stop_ids = stop_ids or []
         stop_sequences: List[List[int]] = []
         if stop_words:
@@ -643,6 +677,32 @@ class llama_cluster_transformer:
                     ids = []
                 if ids:
                     stop_sequences.append(ids)
+        stop_sequences_or_none = stop_sequences if stop_sequences else None
+
+        # Build special/stop token ID sets for runtime filtering.
+        special_id_set = set()
+        model_special = getattr(self.model, "special_token_ids", None)
+        if model_special:
+            for tid in model_special:
+                if isinstance(tid, int) and tid >= 0:
+                    special_id_set.add(int(tid))
+        for tid in (self.tokenizer.bos_id, self.tokenizer.eos_id, self.tokenizer.pad_id):
+            if isinstance(tid, int) and tid >= 0:
+                special_id_set.add(int(tid))
+
+        user_stop_ids = [int(t) for t in stop_ids if isinstance(t, (int, np.integer))]
+        default_stop_ids = set()
+        for attr in ("eot_id", "eom_id", "eos_token_id"):
+            tid = getattr(self.model, attr, None)
+            if isinstance(tid, int) and tid >= 0:
+                default_stop_ids.add(int(tid))
+        if not default_stop_ids and isinstance(self.tokenizer.eos_id, int) and self.tokenizer.eos_id >= 0:
+            default_stop_ids.add(int(self.tokenizer.eos_id))
+
+        stop_id_set = set(user_stop_ids) if user_stop_ids else default_stop_ids
+        skip_id_set = set(special_id_set)
+        skip_id_set.update(stop_id_set)
+        require_non_special_to_stop = not user_stop_ids
 
         # Support a single conversation passed as a list of (role, text)
         if (
@@ -651,12 +711,45 @@ class llama_cluster_transformer:
             and isinstance(prompts[0], (list, tuple))
             and len(prompts[0]) == 2
         ):
-            prompt_texts = [format_messages(prompts)]  # type: ignore[arg-type]
+            prompt_objs = [prompts]  # type: ignore[list-item]
         else:
-            prompt_texts = [format_prompt(x) for x in prompts]  # type: ignore[list-item]
+            prompt_objs = list(prompts)  # type: ignore[list-item]
 
-        bsz = len(prompt_texts)
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompt_texts]
+        prompt_tokens: List[List[int]] = []
+        for obj in prompt_objs:
+            token_ids = None
+            if hasattr(self.model, "add_chat_template"):
+                try:
+                    token_ids = self.model.add_chat_template(
+                        obj,
+                        system_prompt=self.system,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                    )
+                except TypeError:
+                    token_ids = None
+                except Exception:
+                    token_ids = None
+
+            if isinstance(token_ids, dict) and "input_ids" in token_ids:
+                token_ids = token_ids.get("input_ids")
+            if torch.is_tensor(token_ids):
+                token_ids = token_ids.tolist()
+            if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], list):
+                token_ids = token_ids[0]
+
+            if isinstance(token_ids, list) and token_ids:
+                prompt_tokens.append([int(x) for x in token_ids])
+                continue
+
+            prompt_text = render_prompt(obj)
+            bos_flag = True
+            bos_text = getattr(self.model, "bos_token", None)
+            if isinstance(bos_text, str) and bos_text and bos_text in prompt_text:
+                bos_flag = False
+            prompt_tokens.append(self.tokenizer.encode(prompt_text, bos=bos_flag, eos=False))
+
+        bsz = len(prompt_tokens)
         num_input_tokens = [len(t) for t in prompt_tokens]
 
         min_prompt_size = min([len(t) for t in prompt_tokens])
@@ -671,6 +764,8 @@ class llama_cluster_transformer:
 
         start_pos = min_prompt_size
         prev_pos = 0
+        emitted_non_special = [False for _ in range(bsz)]
+        first_non_special_pos: List[Optional[int]] = [None for _ in range(bsz)]
         for cur_pos in range(start_pos, total_len):
             hidden_out = self.run_QKV_mlp_cluster(
                 tokens[:, prev_pos:cur_pos],
@@ -703,29 +798,75 @@ class llama_cluster_transformer:
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
 
-            if on_token is not None:
-                for i in range(bsz):
-                    if not input_text_mask[i, cur_pos]:
-                        tid = int(next_token[i].item())
-                        try:
-                            ttext = self.tokenizer.decode([tid])
-                        except Exception:
-                            ttext = ""
-                        if ttext:
-                            on_token(i, tid, ttext)
+            for i in range(bsz):
+                if input_text_mask[i, cur_pos]:
+                    continue
+                tid = int(next_token[i].item())
+                if tid in skip_id_set:
+                    continue
+                emitted_non_special[i] = True
+                if first_non_special_pos[i] is None:
+                    first_non_special_pos[i] = cur_pos
+                if on_token is not None:
+                    try:
+                        ttext = self.tokenizer.decode([tid])
+                    except Exception:
+                        ttext = ""
+                    if ttext:
+                        on_token(i, tid, ttext)
 
-            if self._should_stop(tokens, prompt_tokens, stop_ids, stop_words):
+            should_stop = False
+            if user_stop_ids:
+                if self._should_stop(tokens, prompt_tokens, list(stop_id_set), stop_sequences_or_none):
+                    should_stop = True
+            else:
+                # Only honor stop IDs after the first non-special token per batch.
+                stop_mask = []
+                for i in range(bsz):
+                    if not emitted_non_special[i]:
+                        stop_mask.append(False)
+                        continue
+                    prompt_len = len(prompt_tokens[i])
+                    gen = tokens[i, prompt_len:cur_pos + 1].tolist()
+                    first_pos = first_non_special_pos[i]
+                    if first_pos is None:
+                        stop_mask.append(False)
+                        continue
+                    start_idx = max(0, first_pos - prompt_len + 1)
+                    stop_mask.append(any(t in stop_id_set for t in gen[start_idx:]))
+                if stop_mask and all(stop_mask):
+                    should_stop = True
+
+                if not should_stop and stop_sequences_or_none:
+                    if all(emitted_non_special):
+                        if self._should_stop(tokens, prompt_tokens, None, stop_sequences_or_none):
+                            should_stop = True
+
+            if should_stop:
                 break
 
         tokens[tokens == self.tokenizer.pad_id] = self.tokenizer.eos_id
         outputs: List[str] = []
         for i, t in enumerate(tokens.tolist()):
-            t = t[: len(prompt_tokens[i]) + max_gen_len]
-            try:
-                t = t[: t.index(self.tokenizer.eos_id)]
-            except ValueError:
-                pass
-            outputs.append(self.tokenizer.decode(t))
+            prompt_len = len(prompt_tokens[i])
+            gen_ids = t[prompt_len: prompt_len + max_gen_len]
+            filtered_gen: List[int] = []
+            stop_after = None
+            if first_non_special_pos[i] is not None:
+                stop_after = max(0, first_non_special_pos[i] - prompt_len + 1)
+            for j, tid in enumerate(gen_ids):
+                if tid == self.tokenizer.pad_id:
+                    continue
+                if tid in stop_id_set:
+                    if stop_after is not None and j >= stop_after:
+                        break
+                    # Ignore stop tokens before any non-special content.
+                    continue
+                if tid in skip_id_set:
+                    continue
+                filtered_gen.append(int(tid))
+            full_ids = prompt_tokens[i] + filtered_gen
+            outputs.append(self.tokenizer.decode(full_ids))
 
         if print_reply:
             for i, prompt in enumerate(prompts):
