@@ -248,6 +248,8 @@ class llama_cluster_transformer:
         self.tokenizer = tokenizer
         self.model = model
         self.kv_cache = {}
+        self.stop_requested = False
+        self.user_stopped = False
 
         self.cluster_zmq_object = self.model.cluster_zmq_object
         self.IP_list = self.model.cluster_zmq_object.node_IP_list
@@ -262,11 +264,18 @@ class llama_cluster_transformer:
         self.n_layers = self.model.num_hidden_layers
         self.n_heads = self.model.num_attention_heads
         self.n_kv_heads = self.model.num_key_value_heads or self.n_heads
-        if self.dim % self.n_heads != 0:
-            raise ValueError(
-                f"Hidden size {self.dim} not divisible by num_attention_heads={self.n_heads}"
-            )
-        self.head_dim = self.dim // self.n_heads
+        self.head_dim = getattr(self.model, "head_dim", None)
+        if not self.head_dim:
+            if self.dim % self.n_heads != 0:
+                raise ValueError(
+                    f"Hidden size {self.dim} not divisible by num_attention_heads={self.n_heads}"
+                )
+            self.head_dim = self.dim // self.n_heads
+        else:
+            if self.dim % self.n_heads != 0:
+                print(
+                    f"⚠️ Hidden size {self.dim} not divisible by num_attention_heads={self.n_heads}; using head_dim from model config."
+                )
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"Invalid head config: num_attention_heads={self.n_heads} "
@@ -289,7 +298,7 @@ class llama_cluster_transformer:
         self.multiple_of = 256  # make SwiGLU hidden layer size multiple of large power of 2
         self.norm_eps = 1e-5
 
-        self.max_batch_size = 32
+        self.max_batch_size = 1
         self.max_seq_len = int(getattr(self.model, "max_position_embeddings", 1024) or 1024)
         self.kv_window = int(os.environ.get("OPEN_CLUSTER_KV_WINDOW", "2048"))
         if self.kv_window <= 0:
@@ -320,6 +329,11 @@ class llama_cluster_transformer:
         self._debug_attn = False
         # Other initialization...
         print(f"✅ Transformer initialized with dim={self.dim}, layers={self.n_layers}, heads={self.n_heads}")
+
+    def request_stop(self):
+        """Signal the generator loop to stop early."""
+        self.stop_requested = True
+        self.user_stopped = True
 
     def _init_kv_cache(self):
         """Initialize key-value cache for attention."""
@@ -626,6 +640,10 @@ class llama_cluster_transformer:
         if self.lm_head is None:
             raise RuntimeError("LM head not available (lm_head missing and tie_word_embeddings is False).")
 
+        # Reset stop flag for a new generation run.
+        self.stop_requested = False
+        self.user_stopped = False
+
         # Reset cache once per generation call (prevents cross-prompt leakage).
         self.clear_kv_cache()
 
@@ -774,6 +792,8 @@ class llama_cluster_transformer:
                 split_dim=self.split_dim,
                 verbos=False,
             )
+            if self.stop_requested or self.user_stopped:
+                break
             logits = self._compute_logits(hidden_out, last_token_only=True)
 
             if repetition_penalty != 1.0:
@@ -867,6 +887,10 @@ class llama_cluster_transformer:
                 filtered_gen.append(int(tid))
             full_ids = prompt_tokens[i] + filtered_gen
             outputs.append(self.tokenizer.decode(full_ids))
+
+        # Clear stop flags after generation completes.
+        self.stop_requested = False
+        self.user_stopped = False
 
         if print_reply:
             for i, prompt in enumerate(prompts):
