@@ -50,6 +50,9 @@ class hugging_face_model_handler:
         self.split_system = 1
         self.split_dim = 1
         self.q_proj_shape = None
+        self.k_proj_shape = None
+        self.v_proj_shape = None
+        self.is_quantized = False
         # Add tokenizer initialization (after config is read)
         self.tokenizer = None
 
@@ -252,6 +255,23 @@ class hugging_face_model_handler:
         if self.model_type != "llama":
             raise ValueError("Only llama models are supported")
 
+        quant_cfg = os.path.join(self.model_path, "quantize_config.json")
+        if os.path.exists(quant_cfg):
+            raise RuntimeError("Quantized (GPTQ/AWQ) models are not supported by this pipeline. Use FP16/BF16 safetensors weights instead.")
+
+        # Early scan for GPTQ/AWQ-style tensors (qweight/scales).
+        try:
+            with safe_open(shard_files[0], framework="pt") as f:
+                for key in f.keys():
+                    key_lower = key.lower()
+                    if "qweight" in key_lower or "qzeros" in key_lower or "gptq" in key_lower:
+                        raise RuntimeError("Quantized (GPTQ/AWQ) tensors detected. This loader expects FP16/BF16 weights.")
+        except RuntimeError:
+            raise
+        except Exception:
+            # If the scan fails for any reason, continue; normal load will surface errors.
+            pass
+
         # ----------------- Split dim -----------------
         if split_dim is None:
             # Pick a stable split dimension based on an existing shard.
@@ -307,8 +327,34 @@ class hugging_face_model_handler:
                         self.other_list.append((key, tensor.shape, shard_shapes))
                         print(f"  ⚠️ Higher-rank tensor '{key}'")
 
+        self._resolve_attention_geometry()
         self.sort_llama_weights()
         self.sort_norms()
+
+    def _resolve_attention_geometry(self):
+        """Ensure head_dim/num_key_value_heads are consistent with actual K/V weight shapes."""
+        if not self.hidden_size or not self.num_attention_heads:
+            return
+
+        if self.hidden_size % self.num_attention_heads != 0:
+            print("⚠️ hidden_size %d not divisible by num_attention_heads %d." % (self.hidden_size, self.num_attention_heads))
+            return
+
+        head_dim = self.hidden_size // self.num_attention_heads
+        self.head_dim = head_dim
+
+        if self.k_proj_shape is not None:
+            k_out = int(self.k_proj_shape[0])
+            if k_out % head_dim == 0:
+                inferred_kv = k_out // head_dim
+                if not self.num_key_value_heads or self.num_key_value_heads != inferred_kv:
+                    print("⚠️ num_key_value_heads mismatch (config=%s). Using inferred num_key_value_heads=%d from k_proj shape." % (self.num_key_value_heads, inferred_kv))
+                    self.num_key_value_heads = inferred_kv
+            else:
+                print("⚠️ k_proj out dim %d not divisible by head_dim %d. Check model compatibility." % (k_out, head_dim))
+
+        if self.num_key_value_heads:
+            self.kv_dim = self.num_key_value_heads * head_dim
 
     def _handle_1d_tensor(self, tensor, key):
         """
@@ -371,6 +417,7 @@ class hugging_face_model_handler:
 
         elif 'k_proj' in key_lower and 'bias' not in key_lower:
             # No expansion here; keep raw K projection weights.
+            self.k_proj_shape = tensor.shape
             cm, shard_shapes = self.wrap_cluster_matrix(
                 tensor,
                 transpose=True,
@@ -387,6 +434,7 @@ class hugging_face_model_handler:
 
         elif 'v_proj' in key_lower and 'bias' not in key_lower:
             # No expansion here; keep raw V projection weights.
+            self.v_proj_shape = tensor.shape
             cm, shard_shapes = self.wrap_cluster_matrix(
                 tensor,
                 transpose=True,
